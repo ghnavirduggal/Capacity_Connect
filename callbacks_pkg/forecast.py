@@ -2,6 +2,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import re
 from typing import Optional, Tuple
 
 import dash
@@ -53,11 +54,36 @@ def _parse_upload(contents: str, filename: str) -> Tuple[pd.DataFrame, str]:
 
 
 def _pick_col(df: pd.DataFrame, candidates: tuple[str, ...]) -> Optional[str]:
-    low = {str(c).strip().lower(): c for c in df.columns}
+    lookup: dict[str, str] = {}
+    for c in df.columns:
+        base = str(c).strip().lower()
+        variants = {
+            base,
+            base.replace(" ", "_"),
+            base.replace(" ", ""),
+            base.replace("-", "_"),
+            base.replace("-", ""),
+            base.replace("_", ""),
+            re.sub(r"[^a-z0-9]", "", base),
+        }
+        for v in variants:
+            lookup.setdefault(v, c)
+
     for nm in candidates:
-        col = low.get(str(nm).strip().lower())
-        if col:
-            return col
+        key = str(nm).strip().lower()
+        candidates_norm = {
+            key,
+            key.replace(" ", "_"),
+            key.replace(" ", ""),
+            key.replace("-", "_"),
+            key.replace("-", ""),
+            key.replace("_", ""),
+            re.sub(r"[^a-z0-9]", "", key),
+        }
+        for cand in candidates_norm:
+            col = lookup.get(cand)
+            if col:
+                return col
     return None
 
 
@@ -65,7 +91,7 @@ def _summarize(df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
     d = df.copy()
-    date_col = _pick_col(d, ("date", "ds", "datetime", "timestamp"))
+    date_col = _pick_col(d, ("date", "ds", "datetime", "timestamp", "month_start"))
     val_col = _pick_col(d, ("volume", "items", "calls", "count", "value"))
 
     if date_col and val_col:
@@ -78,12 +104,52 @@ def _summarize(df: pd.DataFrame) -> pd.DataFrame:
             .sum()
             .rename(columns={val_col: "Total"})
         )
-        grouped["Month"] = grouped["_month"].dt.strftime("%b %Y")
+        grouped["Month"] = grouped["_month"].dt.strftime("%b-%Y")
         grouped = grouped[["Month", "Total"]]
         return grouped
 
     stats = d.describe(include="all").reset_index().rename(columns={"index": "metric"})
     return stats
+
+
+def _normalize_volume_df(df: pd.DataFrame, cat_hint: Optional[str] = None) -> pd.DataFrame:
+    """Standardize common column names so downstream helpers can work with varied uploads."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+
+    d = df.copy()
+    d.columns = [str(c).strip().lower() for c in d.columns]
+
+    # category / forecast group
+    cat_col = cat_hint or _pick_col(d, ("category", "forecast_group", "queue_name"))
+    if cat_col and cat_col != "category":
+        d = d.rename(columns={cat_col: "category"})
+    if "category" not in d.columns:
+        d["category"] = "All"
+    if "forecast_group" not in d.columns:
+        d["forecast_group"] = d["category"]
+    d["category"] = d["category"].astype(str).str.strip()
+    d["forecast_group"] = d["forecast_group"].astype(str).str.strip()
+    d.loc[d["category"].str.lower() == "nan", "category"] = None
+    d.loc[d["forecast_group"].str.lower() == "nan", "forecast_group"] = None
+
+    # date and volume
+    date_col = _pick_col(d, ("date", "ds", "datetime", "timestamp", "month_start"))
+    if date_col and date_col != "date":
+        d = d.rename(columns={date_col: "date"})
+    vol_col = _pick_col(d, ("volume", "items", "calls", "count", "value", "y"))
+    if vol_col and vol_col != "volume":
+        d = d.rename(columns={vol_col: "volume"})
+
+    if "date" in d.columns:
+        d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    if "volume" in d.columns:
+        d["volume"] = pd.to_numeric(d["volume"], errors="coerce")
+
+    if "date" in d.columns and "volume" in d.columns:
+        d = d.dropna(subset=["date", "volume"])
+
+    return d
 
 
 def _aggregate_monthly(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
@@ -122,6 +188,8 @@ def _aggregate_monthly(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
         group_keys.insert(0, "Category")
     agg = d.groupby(group_keys, as_index=False)["_volume"].sum()
     agg = agg.rename(columns={"_volume": "Volume"})
+    if "Month_Start" in agg.columns:
+        agg["Month_Start"] = pd.to_datetime(agg["Month_Start"], errors="coerce").dt.strftime("%b-%Y")
     msg = f"Aggregated to {len(agg):,} monthly rows."
     return agg, msg
 
@@ -313,10 +381,9 @@ def _on_vs_upload(contents, filename):
 
     df, msg = _parse_upload(contents, filename)
     monthly_df, agg_msg = _aggregate_monthly(df)
-    use_df = monthly_df if not monthly_df.empty else df
-    preview = use_df.head(50)
+    preview = monthly_df.head(50) if isinstance(monthly_df, pd.DataFrame) and not monthly_df.empty else df.head(50)
     cols = [{"name": c, "id": c} for c in preview.columns]
-    store = use_df.to_json(date_format="iso", orient="split") if not use_df.empty else None
+    store = df.to_json(date_format="iso", orient="split") if not df.empty else None
     iq_store = None
     if decoded_bytes is not None and filename.lower().endswith((".xlsx", ".xls")):
         try:
@@ -366,19 +433,18 @@ def _run_volume_summary(n_clicks, data_json, modal_open):
     alert_text = "Summary complete. Review results below."
 
     # Normalize column names for downstream helpers
-    df_norm = df.copy()
-    df_norm.columns = [str(c).strip().lower() for c in df_norm.columns]
-    cat_col = _pick_col(df_norm, ("category", "forecast_group", "queue_name"))
-    if not cat_col:
-        df_norm["category"] = "All"
-        cat_col = "category"
-    categories = sorted(df_norm[cat_col].dropna().astype(str).unique().tolist())
+    df_norm = _normalize_volume_df(df)
+    if df_norm.empty:
+        alert_text = "Summary complete. Could not build forecast group view (missing valid date/volume rows)."
+    categories = sorted(df_norm["category"].dropna().astype(str).unique().tolist()) if not df_norm.empty else []
     options = [{"label": c, "value": c} for c in categories]
     chosen = categories[0] if categories else None
 
     def _safe_pivots(cat: str):
         try:
-            piv, split, long_orig, long_monthly, long_daily = forecast_group_pivot_and_long_style(df_norm.rename(columns={cat_col: "category"}), cat)
+            piv, split, long_orig, long_monthly, long_daily = forecast_group_pivot_and_long_style(df_norm, cat)
+            if piv is None or split is None:
+                return pd.DataFrame(), pd.DataFrame()
             return piv, split
         except Exception:
             return pd.DataFrame(), pd.DataFrame()
@@ -387,7 +453,11 @@ def _run_volume_summary(n_clicks, data_json, modal_open):
     pivot_cols = [{"name": c, "id": c} for c in (piv0.columns if not piv0.empty else [])]
     split_cols = [{"name": c, "id": c} for c in (split0.columns if not split0.empty else [])]
 
-    results_store = {"categories": categories, "cat_col": cat_col, "data": data_json}
+    results_store = {
+        "categories": categories,
+        "cat_col": "category",
+        "data": df_norm.to_json(date_format="iso", orient="split") if not df_norm.empty else None,
+    }
 
     return (
         summary.to_dict("records"),
@@ -458,10 +528,15 @@ def _on_category_change(cat, store_json):
         payload = json.loads(store_json)
         data_json = payload.get("data")
         cat_col = payload.get("cat_col", "category")
+        if not data_json:
+            return [], [], [], []
         df = pd.read_json(io.StringIO(data_json), orient="split")
-        df.columns = [str(c).strip().lower() for c in df.columns]
-        df = df.rename(columns={cat_col: "category"})
-        piv, split = forecast_group_pivot_and_long_style(df, cat)
+        df_norm = _normalize_volume_df(df, cat_col)
+        if df_norm.empty:
+            return [], [], [], []
+        piv, split = forecast_group_pivot_and_long_style(df_norm, cat)
+        if piv is None or split is None:
+            return [], [], [], []
         return (
             piv.to_dict("records"),
             [{"name": c, "id": c} for c in piv.columns],
