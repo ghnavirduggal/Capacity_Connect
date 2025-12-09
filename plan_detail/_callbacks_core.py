@@ -1,4 +1,4 @@
-﻿# file: plan_detail/_callbacks_core.py
+# file: plan_detail/_callbacks_core.py
 from __future__ import annotations
 from dash import dcc, html, dash_table, Input, Output, State, ctx, no_update
 import dash
@@ -1226,7 +1226,6 @@ def register_plan_detail_core(app: dash.Dash):
             Output("plan-msg", "children", allow_duplicate=True),
             Output("plan-msg-timer", "disabled", allow_duplicate=True),
             Output("plan-refresh-tick", "data", allow_duplicate=True),
-            Output("global-loading", "data"),
             Input("btn-plan-save", "n_clicks"),
             State("plan-detail-id", "data"),
             State("tbl-fw", "data"), State("tbl-hc", "data"),
@@ -1304,18 +1303,7 @@ def register_plan_detail_core(app: dash.Dash):
             # DEBUG: post-save snapshot
             _verify_storage(pid, when="post-save")
 
-            return "Saved", False, next_tick, False
-
-        # Turn on global overlay immediately on Save click
-        @app.callback(
-            Output("global-loading", "data", allow_duplicate=True),
-            Input("btn-plan-save", "n_clicks"),
-            prevent_initial_call=True
-        )
-        def _show_glob_loading(n):
-            if not n:
-                raise dash.exceptions.PreventUpdate
-            return True
+            return "Saved", False, next_tick
 
         # Upper collapse
         @app.callback(
@@ -1656,34 +1644,14 @@ def register_plan_detail_core(app: dash.Dash):
         def _start_page_loading(_pid):
             # Show overlay as soon as we land on /plan/<id>
             return True
-    
+
         @app.callback(
             Output("global-loading", "data", allow_duplicate=True),
             Input("plan-loading", "data"),
-            prevent_initial_call=True
+            prevent_initial_call=True,
         )
-        def _sync_global_loading(is_loading):
+        def _sync_global_loading_from_plan(is_loading):
             return bool(is_loading)
-
-        @app.callback(
-            Output("plan-loading-overlay", "style"),
-            Input("plan-loading", "data"),
-            prevent_initial_call=False,
-        )
-        def _toggle_plan_overlay(is_loading):
-            base_style = {
-                "position": "fixed",
-                "inset": "0",
-                "background": "rgba(0,0,0,0.6)",
-                "alignItems": "center",
-                "justifyContent": "center",
-                "flexDirection": "column",
-                "zIndex": 9999,
-                "display": "none",
-            }
-            if bool(is_loading):
-                base_style["display"] = "flex"
-            return base_style
 
         @app.callback(
             Output("tbl-hc","data", allow_duplicate=True),
