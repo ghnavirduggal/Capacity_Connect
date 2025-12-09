@@ -296,7 +296,6 @@ def _apply_transformations(df: pd.DataFrame) -> pd.DataFrame:
     Output("vs-preview", "columns"),
     Output("vs-data-store", "data"),
     Output("vs-iq-store", "data"),
-    Output("global-loading", "data", allow_duplicate=True),
     Input("vs-upload", "contents"),
     State("vs-upload", "filename"),
     prevent_initial_call=True,
@@ -331,7 +330,7 @@ def _on_vs_upload(contents, filename):
         except Exception:
             pass
     combined_msg = f"{msg} {agg_msg}".strip()
-    return combined_msg, preview.to_dict("records"), cols, store, iq_store, False
+    return combined_msg, preview.to_dict("records"), cols, store, iq_store
 
 
 @app.callback(
@@ -347,7 +346,6 @@ def _on_vs_upload(contents, filename):
     Output("vs-volume-split", "data"),
     Output("vs-volume-split", "columns"),
     Output("vs-results-store", "data"),
-    Output("global-loading", "data", allow_duplicate=True),
     Input("vs-run-btn", "n_clicks"),
     State("vs-data-store", "data"),
     State("vs-next-modal", "is_open"),
@@ -357,11 +355,11 @@ def _run_volume_summary(n_clicks, data_json, modal_open):
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
     if not data_json:
-        return ([], [], "Upload data to run the summary.", True, False, [], None, [], [], [], [], None, False)
+        return ([], [], "Upload data to run the summary.", True, False, [], None, [], [], [], [], None)
     try:
         df = pd.read_json(io.StringIO(data_json), orient="split")
     except Exception:
-        return ([], [], "Could not read cached data.", True, False, [], None, [], [], [], [], None, False)
+        return ([], [], "Could not read cached data.", True, False, [], None, [], [], [], [], None)
 
     summary = _summarize(df)
     cols = [{"name": c, "id": c} for c in summary.columns]
@@ -404,7 +402,6 @@ def _run_volume_summary(n_clicks, data_json, modal_open):
         (split0.to_dict("records") if not split0.empty else []),
         split_cols,
         json.dumps(results_store),
-        False,
     )
 
 
@@ -473,26 +470,6 @@ def _on_category_change(cat, store_json):
         )
     except Exception:
         return [], [], [], []
-
-
-@app.callback(
-    Output("global-loading", "data", allow_duplicate=True),
-    Input("vs-upload", "contents"),
-    prevent_initial_call=True,
-)
-def _global_loading_on_upload(_):
-    return True
-
-
-@app.callback(
-    Output("global-loading", "data", allow_duplicate=True),
-    Input("vs-run-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def _global_loading_on_summary(n):
-    if not n:
-        raise dash.exceptions.PreventUpdate
-    return True
 
 
 @app.callback(
