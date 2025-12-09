@@ -218,6 +218,79 @@ def _ratio_fig(df: pd.DataFrame, title: str):
     return fig
 
 
+def _fallback_pivots(df: pd.DataFrame, cat: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Lightweight, defensive pivot builders used when the primary helper fails."""
+    if df is None or df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    d = df.copy()
+    if "category" not in d.columns:
+        return pd.DataFrame(), pd.DataFrame()
+    d = d[d["category"] == cat]
+    if d.empty or "date" not in d.columns or "volume" not in d.columns:
+        return pd.DataFrame(), pd.DataFrame()
+
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d["volume"] = pd.to_numeric(d["volume"], errors="coerce")
+    d = d.dropna(subset=["date", "volume"])
+    if d.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    d["Year"] = d["date"].dt.year
+    d["Month_Num"] = d["date"].dt.month
+    d["Month"] = d["date"].dt.strftime("%b")
+    if "forecast_group" not in d.columns:
+        d["forecast_group"] = d["category"]
+
+    months_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    pivot_raw = (
+        d.pivot_table(index=["Year", "forecast_group"], columns="Month", values="volume", aggfunc="sum", fill_value=0)
+        .reset_index()
+    )
+    month_cols = [m for m in months_order if m in pivot_raw.columns]
+
+    # Display pivot (k formatting + growth)
+    display = pivot_raw.copy()
+    if month_cols:
+        display["Yearly_Avg"] = display[month_cols].mean(axis=1)
+    else:
+        display["Yearly_Avg"] = 0
+    display["Growth_%"] = None
+    for fg in display["forecast_group"].unique():
+        idx = display["forecast_group"] == fg
+        growth = display[idx].sort_values("Year")["Yearly_Avg"].pct_change().values
+        display.loc[idx, "Growth_%"] = growth
+    for col in month_cols + ["Yearly_Avg"]:
+        display[col] = display[col].apply(lambda x: f"{float(x) / 1_000:,.1f}k" if pd.notna(x) else "")
+    display["Growth_%"] = display["Growth_%"].apply(
+        lambda x: f"{float(x) * 100:.1f}%" if pd.notna(x) else ""
+    )
+    display = display[["Year", "forecast_group"] + month_cols + ["Yearly_Avg", "Growth_%"]]
+
+    # Volume split (% per year+fg across its months)
+    split = pivot_raw.copy()
+    row_totals = split[month_cols].sum(axis=1) if month_cols else pd.Series(dtype=float)
+    for col in month_cols:
+        split[col] = split[col].where(row_totals == 0, split[col] / row_totals * 100).round(2)
+
+    def _row_avg(row):
+        vals = [row[m] for m in month_cols if pd.notna(row[m]) and row[m] > 0]
+        return round(sum(vals) / len(vals), 1) if vals else pd.NA
+
+    split["Avg"] = split.apply(_row_avg, axis=1) if month_cols else pd.NA
+
+    def _last3(row):
+        vals = [row[m] for m in month_cols if pd.notna(row[m]) and row[m] > 0]
+        if len(vals) >= 3:
+            return round(sum(vals[-3:]) / 3, 1)
+        return round(sum(vals) / len(vals), 1) if vals else pd.NA
+
+    split["Vol_Split_Last_3M"] = split.apply(_last3, axis=1) if month_cols else pd.NA
+    for col in month_cols + ["Avg", "Vol_Split_Last_3M"]:
+        split[col] = split[col].apply(lambda x: f"{float(x):.2f}%" if pd.notna(x) else "")
+    split = split[["Year", "forecast_group"] + month_cols + ["Avg", "Vol_Split_Last_3M"]]
+    return display, split
+
+
 def _smoothing_core(df: pd.DataFrame, window: int, threshold: float, prophet_order: Optional[int] = None):
     """Run EWMA smoothing (or Prophet) + anomaly detection and seasonality pivots."""
     date_col = _pick_col(df, ("date", "ds", "timestamp"))
@@ -443,11 +516,11 @@ def _run_volume_summary(n_clicks, data_json, modal_open):
     def _safe_pivots(cat: str):
         try:
             piv, split, long_orig, long_monthly, long_daily = forecast_group_pivot_and_long_style(df_norm, cat)
-            if piv is None or split is None:
-                return pd.DataFrame(), pd.DataFrame()
+            if piv is None or split is None or piv.empty or split.empty:
+                raise ValueError("Primary pivot empty")
             return piv, split
         except Exception:
-            return pd.DataFrame(), pd.DataFrame()
+            return _fallback_pivots(df_norm, cat)
 
     piv0, split0 = _safe_pivots(chosen) if chosen else (pd.DataFrame(), pd.DataFrame())
     pivot_cols = [{"name": c, "id": c} for c in (piv0.columns if not piv0.empty else [])]
@@ -534,8 +607,13 @@ def _on_category_change(cat, store_json):
         df_norm = _normalize_volume_df(df, cat_col)
         if df_norm.empty:
             return [], [], [], []
-        piv, split = forecast_group_pivot_and_long_style(df_norm, cat)
-        if piv is None or split is None:
+        try:
+            piv, split, _, _, _ = forecast_group_pivot_and_long_style(df_norm, cat)
+            if piv is None or split is None or piv.empty or split.empty:
+                raise ValueError("Primary pivot empty")
+        except Exception:
+            piv, split = _fallback_pivots(df_norm, cat)
+        if piv is None or split is None or piv.empty or split.empty:
             return [], [], [], []
         return (
             piv.to_dict("records"),
