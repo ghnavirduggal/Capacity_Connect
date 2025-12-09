@@ -1,0 +1,10 @@
+__pycache__
+monolith
+venv6
+venv050988
+plan_detail/__pycache__
+pages/__pycache__
+callbacks_pkg/__pycache__
+app_instance.pyc
+.flask_secret_key
+tools
