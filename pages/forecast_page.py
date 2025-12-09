@@ -261,6 +261,33 @@ def page_forecast_section(slug: str):
             className="d-flex justify-content-between align-items-start mb-3 flex-wrap gap-2",
         )
 
+    def _table(id: str, page_size: int = 10):
+        base_style = {
+            "overflowX": "auto",
+            "overflowY": "auto",
+            "border": "1px solid #e9ecef",
+            "borderRadius": "8px",
+            "padding": "4px",
+        }
+        return dash_table.DataTable(
+            id=id,
+            data=[],
+            columns=[],
+            page_size=page_size,
+            style_table=base_style,
+            style_cell={
+                "fontSize": 12,
+                "padding": "6px 8px",
+                "textAlign": "left",
+                "border": "none",
+            },
+            style_header={
+                "backgroundColor": "#f8f9fa",
+                "fontWeight": "600",
+                "border": "none",
+            },
+        )
+
     def _volume_summary_layout(step_meta):
         return html.Div(
             [
@@ -287,24 +314,10 @@ def page_forecast_section(slug: str):
                         dbc.Col(
                             [
                                 html.H4("Preview"),
-                                dash_table.DataTable(
-                                    id="vs-preview",
-                                    data=[],
-                                    columns=[],
-                                    page_size=8,
-                                    style_table={"overflowX": "auto"},
-                                    style_cell={"fontSize": 12},
-                                ),
+                                _table("vs-preview", page_size=8),
                                 html.Hr(),
                                 html.H5("Summary"),
-                                dash_table.DataTable(
-                                    id="vs-summary",
-                                    data=[],
-                                    columns=[],
-                                    page_size=10,
-                                    style_table={"overflowX": "auto"},
-                                    style_cell={"fontSize": 12},
-                                ),
+                                _table("vs-summary", page_size=10),
                                 html.Hr(),
                                 html.Div(
                                     [
@@ -313,24 +326,10 @@ def page_forecast_section(slug: str):
                                     ],
                                     className="mb-2",
                                 ),
-                                dash_table.DataTable(
-                                    id="vs-pivot",
-                                    data=[],
-                                    columns=[],
-                                    page_size=10,
-                                    style_table={"overflowX": "auto"},
-                                    style_cell={"fontSize": 12},
-                                ),
+                                _table("vs-pivot", page_size=10),
                                 html.Hr(),
                                 html.H5("Volume split (%)"),
-                                dash_table.DataTable(
-                                    id="vs-volume-split",
-                                    data=[],
-                                    columns=[],
-                                    page_size=10,
-                                    style_table={"overflowX": "auto"},
-                                    style_cell={"fontSize": 12},
-                                ),
+                                _table("vs-volume-split", page_size=10),
                             ],
                             md=8,
                         ),
