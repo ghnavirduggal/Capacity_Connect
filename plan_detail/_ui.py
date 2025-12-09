@@ -1,4 +1,4 @@
-﻿# file: plan_detail/_ui.py
+# file: plan_detail/_ui.py
 from __future__ import annotations
 from dash import html, dcc, dash_table
 import dash_bootstrap_components as dbc
