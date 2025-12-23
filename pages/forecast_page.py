@@ -214,6 +214,8 @@ def page_forecast_section(slug: str, validation_only: bool = False):
         dcc.Store(id="vs-iq-store", storage_type="memory"),
         dcc.Store(id="vs-iq-summary-store", storage_type="memory"),
         dcc.Store(id="vs-seasonality-store", storage_type="memory"),
+        dcc.Store(id="vs-prophet-store", storage_type="memory"),
+        dcc.Store(id="vs-holiday-store", storage_type="memory"),
     ]
 
     def _stepper(active_slug: str):
@@ -381,6 +383,30 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                 _table("vs-normalized-table", page_size=6),
                                 dbc.Button("Apply Changes", id="vs-apply-seasonality", color="primary", className="mt-2"),
                                 html.Div(id="vs-seasonality-status", className="small text-muted mt-2"),
+                                html.Hr(),
+                                html.H4("Prophet Smoothing"),
+                                dbc.Button("Run Prophet Smoothing", id="vs-run-prophet", color="secondary", className="mb-2"),
+                                html.Div(id="vs-prophet-status", className="small text-muted mb-2"),
+                                html.H5("Data After Prophet Smoothing"),
+                                dash_table.DataTable(
+                                    id="vs-prophet-table",
+                                    data=[],
+                                    columns=[],
+                                    page_size=8,
+                                    editable=True,
+                                    style_table={"overflowX": "auto"},
+                                    style_cell={"fontSize": 12},
+                                ),
+                                html.Hr(),
+                                html.H5("Normalized Contact Ratio 2"),
+                                _table("vs-norm2-table", page_size=6),
+                                dcc.Graph(id="vs-norm2-chart", figure={}, className="mb-2"),
+                                dcc.Graph(id="vs-prophet-line", figure={}, className="mb-2"),
+                                dbc.Button("Save Changes if any else skip", id="vs-save-prophet", color="primary", className="mt-2"),
+                                html.Div(id="vs-prophet-save-status", className="small text-muted mt-2"),
+                                html.Hr(),
+                                dbc.Button("Run Phase 1", id="vs-run-phase1", color="success", className="mt-2"),
+                                html.Div(id="vs-phase1-status", className="small text-muted mt-2"),
                                 html.Hr(),
                                 html.Div(
                                     [
@@ -641,7 +667,7 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                             dbc.Row(
                                                 [
                                                     dbc.Col(dbc.InputGroup([dbc.InputGroupText("Holiday Prior"), dbc.Input(id="fc-prophet-hps", type="number", step=0.01)]), md=6),
-                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("Fourier Order"), dbc.Input(id="fc-prophet-fourier", type="number", step=1)]), md=6),
+                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("Yearly Fourier Order"), dbc.Input(id="fc-prophet-fourier", type="number", step=1)]), md=6),
                                                 ],
                                                 className="g-2 mt-2",
                                             ),
