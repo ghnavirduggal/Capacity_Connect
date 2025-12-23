@@ -5,14 +5,15 @@ import json
 import re
 import logging
 from typing import Any, Optional, Tuple
-
+from prophet import Prophet
 import dash
-from dash import Input, Output, State, no_update, dcc
+from dash import Input, Output, State, no_update, dcc, html
 import dash_bootstrap_components as dbc
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
+from sklearn.preprocessing import MinMaxScaler
 from pathlib import Path
 from app_instance import app
 from plan_detail._common import current_user_fallback
@@ -26,9 +27,10 @@ from forecasting.process_and_IQ_data import (
     fill_final_smoothed_row,
     create_download_csv_with_metadata,
     clean_and_convert_percentage,
+    clean_and_convert_millions,
     add_editable_base_volume,
 )
-from forecasting.contact_ratio_dash import run_phase2_forecast
+from forecasting.contact_ratio_dash import run_contact_ratio_forecast, run_phase2_forecast
 import config_manager
 import os
 
@@ -386,6 +388,215 @@ def _clean_contact_ratio_table(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _month_name_to_num(name: str) -> Optional[int]:
+    month_map = {
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "may": 5,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
+    }
+    if not name:
+        return None
+    return month_map.get(str(name).strip().lower()[:3])
+
+
+def _table_to_long(df: pd.DataFrame, value_name: str) -> pd.DataFrame:
+    if df is None or df.empty or "Year" not in df.columns:
+        return pd.DataFrame()
+    month_cols = [c for c in df.columns if c != "Year"]
+    if not month_cols:
+        return pd.DataFrame()
+    long_df = df.melt(id_vars=["Year"], value_vars=month_cols, var_name="Month", value_name=value_name)
+    long_df["Month_num"] = long_df["Month"].apply(_month_name_to_num)
+    long_df = long_df.dropna(subset=["Month_num"])
+    long_df["ds"] = pd.to_datetime(
+        long_df["Year"].astype(str) + "-" + long_df["Month_num"].astype(int).astype(str).str.zfill(2) + "-01",
+        errors="coerce",
+    )
+    return long_df.dropna(subset=["ds"])
+
+
+def _iq_table_to_long(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or "Year" not in df.columns:
+        return pd.DataFrame()
+    month_cols = [c for c in df.columns if c != "Year"]
+    clean_df = df.copy()
+    for col in month_cols:
+        clean_df[col] = clean_and_convert_millions(clean_df[col])
+    long_df = clean_df.melt(id_vars=["Year"], value_vars=month_cols, var_name="Month", value_name="IQ_value")
+    long_df["Month_num"] = long_df["Month"].apply(_month_name_to_num)
+    long_df = long_df.dropna(subset=["Month_num"])
+    long_df["ds"] = pd.to_datetime(
+        long_df["Year"].astype(str) + "-" + long_df["Month_num"].astype(int).astype(str).str.zfill(2) + "-01",
+        errors="coerce",
+    )
+    return long_df.dropna(subset=["ds"])
+
+
+def _prophet_param_grid(include_holidays: bool) -> list[dict]:
+    cps = [0.003, 0.01, 0.03, 0.1, 0.3]
+    crange = [0.8, 0.9, 0.95]
+    sps = [0.1, 0.3, 1, 3, 10]
+    smode = ["additive", "multiplicative"]
+    n_chg = [3, 5, 8, 10]
+    y_fourier = [3, 4, 5, 6, 8]
+    hps = [0.1, 0.3, 1, 3] if include_holidays else [None]
+
+    combos = []
+    for cp in cps:
+        for cr in crange:
+            for sp in sps:
+                for mode in smode:
+                    for ncp in n_chg:
+                        for yf in y_fourier:
+                            for hp in hps:
+                                combos.append(
+                                    {
+                                        "changepoint_prior_scale": cp,
+                                        "changepoint_range": cr,
+                                        "seasonality_prior_scale": sp,
+                                        "seasonality_mode": mode,
+                                        "n_changepoints": ncp,
+                                        "yearly_fourier_order": yf,
+                                        "holidays_prior_scale": hp,
+                                    }
+                                )
+    max_candidates = 60
+    if len(combos) > max_candidates:
+        rng = np.random.RandomState(42)
+        idx = rng.choice(len(combos), size=max_candidates, replace=False)
+        combos = [combos[i] for i in idx]
+    return combos
+
+
+def _prophet_cv_splits(n: int) -> list[tuple[int, int]]:
+    splits = []
+    for train_len in [15, 18, 21]:
+        if n >= train_len + 3:
+            splits.append((train_len, 3))
+    if not splits and n >= 6:
+        splits.append((n - 3, 3))
+    return splits
+
+
+def _residual_anomaly_rate(residuals: np.ndarray, z_thresh: float = 3.5) -> float:
+    if residuals.size == 0:
+        return 0.0
+    median = np.median(residuals)
+    mad = np.median(np.abs(residuals - median))
+    if mad == 0:
+        std = np.std(residuals)
+        if std == 0:
+            return 0.0
+        zscores = np.abs((residuals - np.mean(residuals)) / std)
+    else:
+        zscores = 0.6745 * np.abs(residuals - median) / mad
+    return float(np.mean(zscores > z_thresh))
+
+
+def _prophet_score_candidate(
+    df: pd.DataFrame,
+    params: dict,
+    splits: list[tuple[int, int]],
+    regressors: list[str],
+    holiday_df: Optional[pd.DataFrame],
+) -> float:
+    scores = []
+    anomaly_threshold = 0.5
+    for train_len, horizon in splits:
+        train = df.iloc[:train_len].copy()
+        val = df.iloc[train_len : train_len + horizon].copy()
+        if train.empty or val.empty:
+            continue
+
+        m = Prophet(
+            changepoint_prior_scale=params["changepoint_prior_scale"],
+            changepoint_range=params["changepoint_range"],
+            seasonality_prior_scale=params["seasonality_prior_scale"],
+            seasonality_mode=params["seasonality_mode"],
+            n_changepoints=params["n_changepoints"],
+            yearly_seasonality=int(params["yearly_fourier_order"]),
+            weekly_seasonality=False,
+            daily_seasonality=False,
+            holidays=holiday_df if params.get("holidays_prior_scale") is not None else None,
+            holidays_prior_scale=params.get("holidays_prior_scale") or 0.1,
+        )
+        reg_cols = []
+        for reg in regressors:
+            if reg in train.columns:
+                m.add_regressor(reg)
+                reg_cols.append(reg)
+        fit_cols = ["ds", "y"] + reg_cols
+        m.fit(train[fit_cols])
+
+        pred = m.predict(val[["ds"] + reg_cols])
+        yhat = pred["yhat"].values
+        y = val["y"].values
+        residuals = y - yhat
+        anomaly_rate = _residual_anomaly_rate(residuals)
+        if anomaly_rate > anomaly_threshold:
+            return float("inf")
+        denom = np.sum(np.abs(y)) or 1e-9
+        wape = np.sum(np.abs(y - yhat)) / denom
+        bias_pct = np.sum(yhat - y) / denom
+        scores.append(wape + 0.5 * abs(bias_pct))
+    if not scores:
+        return float("inf")
+    return float(np.mean(scores))
+
+
+def _prophet_cv_best(
+    df: pd.DataFrame,
+    holiday_df: Optional[pd.DataFrame],
+    regressors: list[str],
+) -> tuple[dict, float]:
+    candidates = _prophet_param_grid(include_holidays=holiday_df is not None)
+    splits = _prophet_cv_splits(len(df))
+    best_score = float("inf")
+    best_params = candidates[0] if candidates else {}
+    for params in candidates:
+        score = _prophet_score_candidate(df, params, splits, regressors, holiday_df)
+        if score < best_score:
+            best_score = score
+            best_params = params
+    return best_params, best_score
+
+
+def _prophet_fit_full(
+    df: pd.DataFrame,
+    params: dict,
+    regressors: list[str],
+    holiday_df: Optional[pd.DataFrame],
+) -> pd.DataFrame:
+    model = Prophet(
+        changepoint_prior_scale=params["changepoint_prior_scale"],
+        changepoint_range=params["changepoint_range"],
+        seasonality_prior_scale=params["seasonality_prior_scale"],
+        seasonality_mode=params["seasonality_mode"],
+        n_changepoints=params["n_changepoints"],
+        yearly_seasonality=int(params["yearly_fourier_order"]),
+        weekly_seasonality=False,
+        daily_seasonality=False,
+        holidays=holiday_df if params.get("holidays_prior_scale") is not None else None,
+        holidays_prior_scale=params.get("holidays_prior_scale") or 0.1,
+    )
+    reg_cols = []
+    for reg in regressors:
+        if reg in df.columns:
+            model.add_regressor(reg)
+            reg_cols.append(reg)
+    fit_cols = ["ds", "y"] + reg_cols
+    model.fit(df[fit_cols])
+    pred = model.predict(df[["ds"] + reg_cols])
+    return pred
 def _apply_caps(df: pd.DataFrame, lower: Optional[float], upper: Optional[float]) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -943,13 +1154,14 @@ def _apply_transformations(df: pd.DataFrame) -> pd.DataFrame:
     Output("vs-data-store", "data"),
     Output("vs-iq-store", "data"),
     Output("vs-iq-summary-store", "data"),
+    Output("vs-holiday-store", "data"),
     Input("vs-upload", "contents"),
     State("vs-upload", "filename"),
     prevent_initial_call=True,
 )
 def _on_vs_upload(contents, filename):
     if not contents or not filename:
-        return "No file supplied.", [], [], None, None, None
+        return "No file supplied.", [], [], None, None, None, None
 
     try:
         logger.info("vs-upload: start filename=%s", filename)
@@ -973,6 +1185,7 @@ def _on_vs_upload(contents, filename):
         store = df.to_json(date_format="iso", orient="split") if not df.empty else None
         iq_store = None
         iq_summary_store = None
+        holiday_store = None
         if decoded_bytes is not None and filename.lower().endswith((".xlsx", ".xls", ".xlsm")):
             try:
                 xl = pd.ExcelFile(io.BytesIO(decoded_bytes))
@@ -998,13 +1211,36 @@ def _on_vs_upload(contents, filename):
                     msg = f"{msg} | IQ summary ready ({len(iq_results)} categories)."
             except Exception:
                 iq_summary_store = None
+            try:
+                holiday_sheet = next(
+                    (s for s in xl.sheet_names if "holiday" in str(s).lower()),
+                    None,
+                )
+                if holiday_sheet:
+                    df_holidays = xl.parse(holiday_sheet)
+                    df_holidays.columns = [
+                        str(col).strip().lower().replace(" ", "_")
+                        for col in df_holidays.columns
+                    ]
+                    date_col = _pick_col(df_holidays, ("date", "holiday_date"))
+                    name_col = _pick_col(df_holidays, ("holidays", "holiday", "name"))
+                    if date_col and name_col:
+                        df_holidays[date_col] = pd.to_datetime(df_holidays[date_col], errors="coerce")
+                        df_holidays = df_holidays.dropna(subset=[date_col, name_col])
+                        holiday_store = {
+                            "mapping": {
+                                str(k): v for k, v in zip(df_holidays[date_col], df_holidays[name_col])
+                            }
+                        }
+            except Exception:
+                holiday_store = None
         pivot_msg = "Preview shows Category by Month view." if not pivot_preview.empty else ""
         combined_msg = " ".join(part for part in [msg, agg_msg, pivot_msg] if part).strip()
         logger.info("vs-upload: complete rows=%s cols=%s", len(df.index), len(df.columns))
-        return combined_msg, preview.to_dict("records"), cols, store, iq_store, iq_summary_store
+        return combined_msg, preview.to_dict("records"), cols, store, iq_store, iq_summary_store, json.dumps(holiday_store) if holiday_store else None
     except Exception as exc:
         logger.exception("vs-upload: failed")
-        return f"Upload failed: {exc}", [], [], None, None, None
+        return f"Upload failed: {exc}", [], [], None, None, None, None
 
 
 @app.callback(
@@ -1345,6 +1581,8 @@ def _build_volume_seasonality(cat, iq_summary_store):
         seasonality_store = {
             "ratio": ratio_seasonality_df.to_json(date_format="iso", orient="split"),
             "capped": capped_df.to_json(date_format="iso", orient="split"),
+            "recalc": recalc_df.to_json(date_format="iso", orient="split"),
+            "normalized": normalized_df.to_json(date_format="iso", orient="split"),
             "base_volume": base_volume,
         }
 
@@ -1417,6 +1655,7 @@ def _apply_seasonality_changes(n_clicks, capped_rows, lower_cap, upper_cap, base
     seasonality_store = {
         "capped": capped_df.to_json(date_format="iso", orient="split"),
         "recalc": recalc_df.to_json(date_format="iso", orient="split"),
+        "normalized": normalized_df.to_json(date_format="iso", orient="split"),
         "base_volume": _safe_float(base_volume, 0.0),
     }
 
@@ -1430,6 +1669,280 @@ def _apply_seasonality_changes(n_clicks, capped_rows, lower_cap, upper_cap, base
         "Seasonality updated.",
         json.dumps(seasonality_store),
     )
+
+
+@app.callback(
+    Output("vs-prophet-status", "children"),
+    Output("vs-prophet-table", "data"),
+    Output("vs-prophet-table", "columns"),
+    Output("vs-norm2-table", "data"),
+    Output("vs-norm2-table", "columns"),
+    Output("vs-norm2-chart", "figure"),
+    Output("vs-prophet-line", "figure"),
+    Output("vs-prophet-store", "data"),
+    Input("vs-run-prophet", "n_clicks"),
+    State("vs-seasonality-store", "data"),
+    State("vs-iq-summary-store", "data"),
+    State("vs-category", "value"),
+    State("vs-holiday-store", "data"),
+    prevent_initial_call=True,
+)
+def _run_prophet_smoothing(n_clicks, seasonality_store, iq_summary_store, cat, holiday_store):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    if not seasonality_store:
+        return "Run seasonality adjustments first.", [], [], [], [], _empty_fig("No data"), _empty_fig(), None
+    if not iq_summary_store or not cat:
+        return "Select a category with IQ data.", [], [], [], [], _empty_fig("No data"), _empty_fig(), None
+
+    try:
+        season_payload = json.loads(seasonality_store) if isinstance(seasonality_store, str) else seasonality_store
+        normalized_json = season_payload.get("normalized")
+        ratio_json = season_payload.get("ratio")
+        if not normalized_json:
+            return "Normalized ratio not found.", [], [], [], [], _empty_fig("No data"), _empty_fig(), None
+        normalized_df = pd.read_json(io.StringIO(normalized_json), orient="split")
+        normalized_long = _table_to_long(normalized_df, "Normalized_Ratio_1")
+        if normalized_long.empty:
+            return "Normalized ratio is empty.", [], [], [], [], _empty_fig("No data"), _empty_fig(), None
+        ratio_long = pd.DataFrame()
+        if ratio_json:
+            ratio_df = pd.read_json(io.StringIO(ratio_json), orient="split")
+            ratio_long = _table_to_long(ratio_df, "Original_Contact_Ratio")
+
+        iq_df, _, _ = _iq_tables_from_store(iq_summary_store, cat)
+        iq_long = _iq_table_to_long(iq_df)
+        df_long = normalized_long.merge(iq_long[["ds", "IQ_value"]], on="ds", how="left")
+        if not ratio_long.empty:
+            df_long = df_long.merge(ratio_long[["ds", "Original_Contact_Ratio"]], on="ds", how="left")
+        df_long["IQ_value"] = pd.to_numeric(df_long["IQ_value"], errors="coerce").fillna(1.0)
+        scaler = MinMaxScaler()
+        df_long["IQ_value_scaled"] = scaler.fit_transform(df_long[["IQ_value"]]).round(4)
+        df_long = df_long.sort_values("ds").reset_index(drop=True)
+        df_long["y"] = df_long["Normalized_Ratio_1"]
+
+        holiday_df = None
+        if holiday_store:
+            try:
+                h_payload = json.loads(holiday_store) if isinstance(holiday_store, str) else holiday_store
+                mapping = h_payload.get("mapping", {})
+                if mapping:
+                    holiday_df = pd.DataFrame(
+                        {"ds": pd.to_datetime(list(mapping.keys()), errors="coerce"), "holiday": list(mapping.values())}
+                    )
+                    holiday_df = holiday_df.dropna(subset=["ds"])
+            except Exception:
+                holiday_df = None
+
+        regressors = ["IQ_value_scaled"]
+        best_params, best_score = _prophet_cv_best(df_long, holiday_df, regressors)
+        pred = _prophet_fit_full(df_long, best_params, regressors, holiday_df)
+
+        df_long["Final_Smoothed_Value"] = pred["yhat"].values.round(4)
+        df_long["Year"] = df_long["ds"].dt.year
+        df_long["Month"] = df_long["ds"].dt.strftime("%b")
+
+        norm2_pivot = (
+            df_long.pivot_table(index="Year", columns="Month", values="Final_Smoothed_Value")
+            .reset_index()
+        )
+        months_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        cols = ["Year"] + [m for m in months_order if m in norm2_pivot.columns]
+        norm2_pivot = norm2_pivot[cols]
+
+        line_fig = go.Figure()
+        line_fig.add_trace(
+            go.Scatter(x=df_long["ds"], y=df_long["Normalized_Ratio_1"], name="Normalized Ratio 1", mode="lines+markers")
+        )
+        line_fig.add_trace(
+            go.Scatter(x=df_long["ds"], y=df_long["Final_Smoothed_Value"], name="Final Smoothed Value", mode="lines+markers")
+        )
+        line_fig.update_layout(title="Prophet Smoothing", xaxis_title="Month", yaxis_title="Value")
+
+        table_cols = ["ds", "Normalized_Ratio_1", "Final_Smoothed_Value", "IQ_value"]
+        if "Original_Contact_Ratio" in df_long.columns:
+            table_cols.insert(2, "Original_Contact_Ratio")
+        table_df = df_long[table_cols].copy()
+        table_df["ds"] = pd.to_datetime(table_df["ds"]).dt.strftime("%Y-%m-%d")
+        columns = []
+        for col in table_df.columns:
+            columns.append({"name": col, "id": col, "editable": col == "Final_Smoothed_Value"})
+
+        store_payload = {
+            "prophet_table": table_df.to_json(date_format="iso", orient="split"),
+            "norm2": norm2_pivot.to_json(date_format="iso", orient="split"),
+            "params": best_params,
+            "score": best_score,
+            "ready": True,
+        }
+
+        status = f"Prophet smoothing complete. Best score (WAPE + 0.5*bias): {best_score:.4f}"
+
+        return (
+            status,
+            table_df.to_dict("records"),
+            columns,
+            norm2_pivot.to_dict("records"),
+            _cols(norm2_pivot),
+            _ratio_fig(norm2_pivot, "Normalized Contact Ratio 2"),
+            line_fig,
+            json.dumps(store_payload),
+        )
+    except Exception:
+        logger.exception("vs-prophet: failed")
+        return "Prophet smoothing failed.", [], [], [], [], _empty_fig("Error"), _empty_fig(), None
+
+
+@app.callback(
+    Output("vs-prophet-save-status", "children"),
+    Output("vs-prophet-store", "data", allow_duplicate=True),
+    Output("vs-norm2-table", "data", allow_duplicate=True),
+    Output("vs-norm2-table", "columns", allow_duplicate=True),
+    Output("vs-norm2-chart", "figure", allow_duplicate=True),
+    Input("vs-save-prophet", "n_clicks"),
+    State("vs-prophet-table", "data"),
+    State("vs-prophet-store", "data"),
+    prevent_initial_call=True,
+)
+def _save_prophet_changes(n_clicks, table_rows, prophet_store):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    if not prophet_store:
+        return "Run Prophet smoothing first.", no_update, no_update, no_update, no_update
+    try:
+        payload = json.loads(prophet_store) if isinstance(prophet_store, str) else prophet_store
+        orig_json = payload.get("prophet_table")
+        orig_df = pd.read_json(io.StringIO(orig_json), orient="split") if orig_json else pd.DataFrame()
+    except Exception:
+        orig_df = pd.DataFrame()
+        payload = {}
+
+    new_df = pd.DataFrame(table_rows) if table_rows else pd.DataFrame()
+    if orig_df.empty or new_df.empty:
+        return "No data to save.", no_update, no_update, no_update, no_update
+
+    changed = False
+    if "Final_Smoothed_Value" in new_df.columns:
+        try:
+            changed = not np.allclose(
+                pd.to_numeric(new_df["Final_Smoothed_Value"], errors="coerce"),
+                pd.to_numeric(orig_df["Final_Smoothed_Value"], errors="coerce"),
+                equal_nan=True,
+            )
+        except Exception:
+            changed = True
+
+    new_df["ds"] = pd.to_datetime(new_df["ds"], errors="coerce")
+    new_df["Year"] = new_df["ds"].dt.year
+    new_df["Month"] = new_df["ds"].dt.strftime("%b")
+    norm2_pivot = (
+        new_df.pivot_table(index="Year", columns="Month", values="Final_Smoothed_Value")
+        .reset_index()
+    )
+    months_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    cols = ["Year"] + [m for m in months_order if m in norm2_pivot.columns]
+    norm2_pivot = norm2_pivot[cols]
+
+    payload["prophet_table"] = new_df.to_json(date_format="iso", orient="split")
+    payload["norm2"] = norm2_pivot.to_json(date_format="iso", orient="split")
+    payload["ready"] = True
+
+    if not changed:
+        status = (
+            "No changes detected - Phase 1 is ready immediately! "
+            "You can run Phase 1 below (no need to Save Changes if there aren't any!)."
+        )
+    else:
+        status = "Changes saved. Phase 1 is ready."
+
+    return (
+        status,
+        json.dumps(payload),
+        norm2_pivot.to_dict("records"),
+        _cols(norm2_pivot),
+        _ratio_fig(norm2_pivot, "Normalized Contact Ratio 2"),
+    )
+
+
+@app.callback(
+    Output("vs-phase1-status", "children"),
+    Output("forecast-phase-store", "data", allow_duplicate=True),
+    Input("vs-run-phase1", "n_clicks"),
+    State("vs-prophet-store", "data"),
+    State("forecast-phase-store", "data"),
+    State("vs-holiday-store", "data"),
+    prevent_initial_call=True,
+)
+def _run_phase1_from_volume(n_clicks, prophet_store, phase_store, holiday_store):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    if not prophet_store:
+        return "Run Prophet smoothing first.", phase_store
+
+    payload = _normalize_phase_store(prophet_store)
+    prophet_json = payload.get("prophet_table") if isinstance(payload, dict) else None
+    if not prophet_json:
+        return "Prophet data missing.", phase_store
+    df = pd.read_json(io.StringIO(prophet_json), orient="split")
+    if df.empty:
+        return "Prophet data missing.", phase_store
+    df["ds"] = pd.to_datetime(df["ds"], errors="coerce")
+    df["Final_Smoothed_Value"] = pd.to_numeric(df["Final_Smoothed_Value"], errors="coerce")
+    df["y"] = df["Final_Smoothed_Value"] / 100
+
+    holiday_df = None
+    if holiday_store:
+        try:
+            h_payload = json.loads(holiday_store) if isinstance(holiday_store, str) else holiday_store
+            mapping = h_payload.get("mapping", {})
+            if mapping:
+                holiday_df = pd.DataFrame(
+                    {"ds": pd.to_datetime(list(mapping.keys()), errors="coerce"), "holiday": list(mapping.values())}
+                )
+                holiday_df = holiday_df.dropna(subset=["ds"])
+        except Exception:
+            holiday_df = None
+
+    config = config_manager.load_config()
+    forecast_res = run_contact_ratio_forecast(
+        df,
+        12,
+        holiday_mapping=None,
+        holiday_original_date=holiday_df,
+        config=config,
+    )
+    train = forecast_res.get("train", pd.DataFrame())
+    test = forecast_res.get("test", pd.DataFrame())
+    total_points = len(df)
+    status_lines = [
+        f"Starting Phase 1 Processing",
+        f"Total data points: {total_points} months",
+    ]
+    if not train.empty:
+        status_lines.append(
+            f"Train Period: {train['ds'].min().strftime('%b %Y')} to {train['ds'].max().strftime('%b %Y')} ({len(train)} months)"
+        )
+    if not test.empty:
+        status_lines.append(
+            f"Test Period: {test['ds'].min().strftime('%b %Y')} to {test['ds'].max().strftime('%b %Y')} ({len(test)} months)"
+        )
+    results = forecast_res.get("forecast_results", {})
+    if results:
+        status_lines.append("Prophet Forecast Done" if results.get("prophet") is not None else "Prophet Forecast Failed")
+        status_lines.append("RF Forecast Done" if results.get("random_forest") is not None else "RF Forecast Failed")
+        status_lines.append("XGBoost Forecast Done" if results.get("xgboost") is not None else "XGBoost Forecast Failed")
+        status_lines.append("VAR Forecast Done" if results.get("var") is not None else "VAR Forecast Failed")
+        status_lines.append("Sarimax Forecast Done" if results.get("sarimax") is not None else "Sarimax Forecast Failed")
+
+    phase_data = _normalize_phase_store(phase_store)
+    phase_data["phase1"] = json.dumps(
+        _phase1_compact_from_results(
+            {"smoothed": df[["ds", "Final_Smoothed_Value"]].rename(columns={"Final_Smoothed_Value": "smoothed"}).to_dict("records")}
+        )
+    )
+    phase_data["phase1_meta"] = {"source": "prophet-volume-summary", "ts": pd.Timestamp.utcnow().isoformat()}
+
+    return html.Ul([html.Li(line) for line in status_lines]), phase_data
 
 
 @app.callback(
@@ -1807,7 +2320,7 @@ def _config_fields():
             "changepoint_prior_scale": "fc-prophet-cps",
             "seasonality_prior_scale": "fc-prophet-sps",
             "holidays_prior_scale": "fc-prophet-hps",
-            "monthly_fourier_order": "fc-prophet-fourier",
+            "yearly_fourier_order": "fc-prophet-fourier",
             "use_holidays": "fc-prophet-holidays",
             "use_iq_value_scaled": "fc-prophet-iq",
         },
@@ -1914,7 +2427,11 @@ def _config_save_load(
                     "changepoint_prior_scale": float(p_cps or cfg["prophet"]["changepoint_prior_scale"]),
                     "seasonality_prior_scale": float(p_sps or cfg["prophet"]["seasonality_prior_scale"]),
                     "holidays_prior_scale": float(p_hps or cfg["prophet"]["holidays_prior_scale"]),
-                    "monthly_fourier_order": int(p_fourier or cfg["prophet"]["monthly_fourier_order"]),
+                    "yearly_fourier_order": int(
+                        p_fourier
+                        or cfg["prophet"].get("yearly_fourier_order")
+                        or cfg["prophet"].get("monthly_fourier_order", 5)
+                    ),
                     "use_holidays": bool(p_holidays),
                     "use_iq_value_scaled": bool(p_iq),
                 }
@@ -1998,7 +2515,7 @@ def _populate_config(cfg):
         p.get("changepoint_prior_scale"),
         p.get("seasonality_prior_scale"),
         p.get("holidays_prior_scale"),
-        p.get("monthly_fourier_order"),
+        p.get("yearly_fourier_order", p.get("monthly_fourier_order")),
         p.get("use_holidays"),
         p.get("use_iq_value_scaled"),
         rf.get("n_estimators"),
