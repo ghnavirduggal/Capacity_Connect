@@ -141,16 +141,18 @@ def prophet_forecast(
     cfg = prop_config or config or {}
     holiday_df = holidays if holidays is not None else holidays_df
     use_holidays = cfg.get("use_holidays", True)
+    yearly_value = cfg.get("yearly_fourier_order")
+    if yearly_value is None:
+        yearly_value = cfg.get("monthly_fourier_order", cfg.get("yearly_seasonality", seasonality))
     m = Prophet(
         changepoint_prior_scale=cfg.get("changepoint_prior_scale", 0.05),
         seasonality_prior_scale=cfg.get("seasonality_prior_scale", 0.1),
         holidays_prior_scale=cfg.get("holidays_prior_scale", 0.1),
-        yearly_seasonality=cfg.get("yearly_seasonality", seasonality),
+        yearly_seasonality=yearly_value,
         weekly_seasonality=cfg.get("weekly_seasonality", False),
         daily_seasonality=cfg.get("daily_seasonality", False),
         holidays=holiday_df if use_holidays else None,
     )
-    m.add_seasonality(name="monthly", period=30.5, fourier_order=cfg.get("monthly_fourier_order", 5))
 
     reg_cols: list[str] = []
     if regressors:
@@ -909,16 +911,18 @@ def run_prophet_smoothing(
     if holiday_original_date is not None and prop_config.get("use_holidays", True):
         holiday_df = _normalize_holidays(holiday_original_date)
 
+    yearly_value = prop_config.get("yearly_fourier_order")
+    if yearly_value is None:
+        yearly_value = prop_config.get("monthly_fourier_order", prop_config.get("yearly_seasonality", True))
     model = Prophet(
         changepoint_prior_scale=prop_config.get("changepoint_prior_scale", 0.05),
         seasonality_prior_scale=prop_config.get("seasonality_prior_scale", 0.1),
         holidays_prior_scale=prop_config.get("holidays_prior_scale", 0.1),
-        yearly_seasonality=prop_config.get("yearly_seasonality", True),
+        yearly_seasonality=yearly_value,
         weekly_seasonality=prop_config.get("weekly_seasonality", False),
         daily_seasonality=prop_config.get("daily_seasonality", False),
         holidays=holiday_df,
     )
-    model.add_seasonality(name="monthly", period=30.5, fourier_order=prop_config.get("monthly_fourier_order", 5))
     for reg in prophet_regressors:
         if reg in df_long.columns:
             model.add_regressor(reg)
