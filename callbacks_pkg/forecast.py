@@ -25,6 +25,8 @@ from forecasting.process_and_IQ_data import (
     accuracy_phase1,
     fill_final_smoothed_row,
     create_download_csv_with_metadata,
+    clean_and_convert_percentage,
+    add_editable_base_volume,
 )
 from forecasting.contact_ratio_dash import run_phase2_forecast
 import config_manager
@@ -363,6 +365,69 @@ def _clean_table(df: pd.DataFrame) -> pd.DataFrame:
     return cleaned.applymap(_strip_nan)
 
 
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    try:
+        return float(val)
+    except Exception:
+        return default
+
+
+def _clean_contact_ratio_table(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    cols = ["Year"] + [m for m in months if m in df.columns]
+    if "Year" not in df.columns:
+        return pd.DataFrame()
+    out = df[cols].copy()
+    for col in out.columns:
+        if col != "Year":
+            out[col] = clean_and_convert_percentage(out[col])
+    return out
+
+
+def _apply_caps(df: pd.DataFrame, lower: Optional[float], upper: Optional[float]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    capped = df.copy()
+    month_cols = [c for c in capped.columns if c not in ["Year", "Avg"]]
+    for col in month_cols:
+        capped[col] = pd.to_numeric(capped[col], errors="coerce")
+    low = _safe_float(lower, None)
+    high = _safe_float(upper, None)
+    if low is not None:
+        capped[month_cols] = capped[month_cols].clip(lower=low)
+    if high is not None:
+        capped[month_cols] = capped[month_cols].clip(upper=high)
+    return capped
+
+
+def _recalculate_seasonality(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    month_cols = [c for c in out.columns if c not in ["Year", "Avg"]]
+    for col in month_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    row_means = out[month_cols].mean(axis=1)
+    row_means = row_means.replace(0, np.nan)
+    out[month_cols] = out[month_cols].div(row_means, axis=0).round(2)
+    out[month_cols] = out[month_cols].fillna(0)
+    out["Avg"] = out[month_cols].mean(axis=1).round(2)
+    return out
+
+
+def _normalized_ratio_table(df: pd.DataFrame, base_volume: Optional[float]) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    base = _safe_float(base_volume, 0.0)
+    out = df.copy()
+    month_cols = [c for c in out.columns if c not in ["Year", "Avg"]]
+    out[month_cols] = (out[month_cols].astype(float) * base).round(2)
+    out["Avg"] = out[month_cols].mean(axis=1).round(2)
+    return out
+
+
 def _normalize_phase_store(phase_store: Any) -> dict:
     if not phase_store:
         return {}
@@ -412,15 +477,22 @@ def _vs_upload_hide_loader(_msg):
 
 @app.callback(Output("global-loading", "data", allow_duplicate=True), Input("vs-run-btn", "n_clicks"), prevent_initial_call=True)
 def _vs_show_loader(_n):
-    if not _n:
-        logger.info("vs-run: show loader skipped (no clicks)")
+    ctx = dash.callback_context
+    triggered_val = ctx.triggered[0].get("value") if ctx.triggered else None
+    if not triggered_val:
+        logger.info("vs-run: show loader skipped (no click)")
         raise dash.exceptions.PreventUpdate
-    logger.info("vs-run: show loader")
+    logger.info("vs-run: show loader n_clicks=%s", _n)
     return True
 
 
-@app.callback(Output("global-loading", "data", allow_duplicate=True), Input("vs-alert", "children"), prevent_initial_call=True)
-def _vs_hide_loader(_msg):
+@app.callback(
+    Output("global-loading", "data", allow_duplicate=True),
+    Input("vs-alert", "children"),
+    Input("vs-results-store", "data"),
+    prevent_initial_call=True,
+)
+def _vs_hide_loader(_msg, _results):
     logger.info("vs-run: hide loader")
     return False
 
@@ -955,7 +1027,6 @@ def _on_vs_upload(contents, filename):
     Output("vs-contact-summary", "columns"),
     Output("vs-results-store", "data"),
     Output("forecast-phase-store", "data", allow_duplicate=True),
-    Output("global-loading", "data"),
     Input("vs-run-btn", "n_clicks"),
     State("vs-data-store", "data"),
     State("vs-iq-summary-store", "data"),
@@ -989,7 +1060,6 @@ def _run_volume_summary(n_clicks, data_json, iq_summary_store, modal_open, phase
             [],
             None,
             phase_store,
-            False,
         )
     try:
         df = pd.read_json(io.StringIO(data_json), orient="split")
@@ -1102,7 +1172,6 @@ def _run_volume_summary(n_clicks, data_json, iq_summary_store, modal_open, phase
             ratio_cols,
             json.dumps(results_store),
             phase_data,
-            False,
         )
     except Exception as exc:
         logger.exception("vs-run: failed")
@@ -1126,7 +1195,6 @@ def _run_volume_summary(n_clicks, data_json, iq_summary_store, modal_open, phase
             [],
             None,
             phase_store,
-            False,
         )
 
 
@@ -1235,6 +1303,132 @@ def _on_category_change(cat, store_json, iq_summary_store):
         vol_cols,
         ratio_rows,
         ratio_cols,
+    )
+
+
+@app.callback(
+    Output("vs-seasonality-table", "data"),
+    Output("vs-seasonality-table", "columns"),
+    Output("vs-seasonality-chart", "figure"),
+    Output("vs-capped-editor", "data"),
+    Output("vs-capped-editor", "columns"),
+    Output("vs-recalc-table", "data"),
+    Output("vs-recalc-table", "columns"),
+    Output("vs-capped-chart", "figure"),
+    Output("vs-base-volume", "value"),
+    Output("vs-normalized-table", "data"),
+    Output("vs-normalized-table", "columns"),
+    Output("vs-seasonality-status", "children"),
+    Output("vs-seasonality-store", "data"),
+    Input("vs-category", "value"),
+    Input("vs-iq-summary-store", "data"),
+    prevent_initial_call=True,
+)
+def _build_volume_seasonality(cat, iq_summary_store):
+    if not cat or not iq_summary_store:
+        raise dash.exceptions.PreventUpdate
+    try:
+        _, _, ratio_df = _iq_tables_from_store(iq_summary_store, cat)
+        if ratio_df is None or ratio_df.empty:
+            return [], [], _empty_fig("No ratio data"), [], [], [], [], _empty_fig("No data"), None, [], [], "No ratio data.", None
+        cleaned_ratio = _clean_contact_ratio_table(ratio_df)
+        if cleaned_ratio.empty:
+            return [], [], _empty_fig("No ratio data"), [], [], [], [], _empty_fig("No data"), None, [], [], "No ratio data.", None
+        seasonality_fig, capped_df, ratio_seasonality_df = plot_contact_ratio_seasonality(cleaned_ratio, unique_key=str(cat))
+        ratio_seasonality_df = ratio_seasonality_df.round(2)
+        capped_df = capped_df.round(2)
+
+        _, base_volume = add_editable_base_volume(ratio_df)
+        recalc_df = _recalculate_seasonality(capped_df)
+        normalized_df = _normalized_ratio_table(recalc_df, base_volume)
+
+        seasonality_store = {
+            "ratio": ratio_seasonality_df.to_json(date_format="iso", orient="split"),
+            "capped": capped_df.to_json(date_format="iso", orient="split"),
+            "base_volume": base_volume,
+        }
+
+        return (
+            ratio_seasonality_df.to_dict("records"),
+            _cols(ratio_seasonality_df),
+            seasonality_fig,
+            capped_df.to_dict("records"),
+            _cols(capped_df),
+            recalc_df.to_dict("records"),
+            _cols(recalc_df),
+            _ratio_fig(recalc_df, "Capped Seasonality Chart"),
+            base_volume,
+            normalized_df.to_dict("records"),
+            _cols(normalized_df),
+            "Seasonality loaded.",
+            json.dumps(seasonality_store),
+        )
+    except Exception:
+        logger.exception("vs-seasonality: failed")
+        return [], [], _empty_fig("Error"), [], [], [], [], _empty_fig("Error"), None, [], [], "Seasonality failed.", None
+
+
+@app.callback(
+    Output("vs-capped-editor", "data", allow_duplicate=True),
+    Output("vs-recalc-table", "data", allow_duplicate=True),
+    Output("vs-recalc-table", "columns", allow_duplicate=True),
+    Output("vs-capped-chart", "figure", allow_duplicate=True),
+    Output("vs-normalized-table", "data", allow_duplicate=True),
+    Output("vs-normalized-table", "columns", allow_duplicate=True),
+    Output("vs-seasonality-status", "children", allow_duplicate=True),
+    Output("vs-seasonality-store", "data", allow_duplicate=True),
+    Input("vs-apply-seasonality", "n_clicks"),
+    State("vs-capped-editor", "data"),
+    State("vs-lower-cap", "value"),
+    State("vs-upper-cap", "value"),
+    State("vs-base-volume", "value"),
+    State("vs-seasonality-store", "data"),
+    prevent_initial_call=True,
+)
+def _apply_seasonality_changes(n_clicks, capped_rows, lower_cap, upper_cap, base_volume, seasonality_store):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+
+    capped_df = pd.DataFrame(capped_rows) if capped_rows else pd.DataFrame()
+    if capped_df.empty and seasonality_store:
+        try:
+            payload = json.loads(seasonality_store) if isinstance(seasonality_store, str) else seasonality_store
+            cached = payload.get("capped")
+            if cached:
+                capped_df = pd.read_json(io.StringIO(cached), orient="split")
+        except Exception:
+            capped_df = pd.DataFrame()
+
+    if capped_df.empty:
+        return no_update, no_update, no_update, no_update, no_update, no_update, "No seasonality data to apply.", no_update
+
+    capped_df = _apply_caps(capped_df, lower_cap, upper_cap)
+    recalc_df = _recalculate_seasonality(capped_df)
+
+    if base_volume is None and seasonality_store:
+        try:
+            payload = json.loads(seasonality_store) if isinstance(seasonality_store, str) else seasonality_store
+            base_volume = payload.get("base_volume")
+        except Exception:
+            base_volume = None
+
+    normalized_df = _normalized_ratio_table(recalc_df, base_volume)
+
+    seasonality_store = {
+        "capped": capped_df.to_json(date_format="iso", orient="split"),
+        "recalc": recalc_df.to_json(date_format="iso", orient="split"),
+        "base_volume": _safe_float(base_volume, 0.0),
+    }
+
+    return (
+        capped_df.to_dict("records"),
+        recalc_df.to_dict("records"),
+        _cols(recalc_df),
+        _ratio_fig(recalc_df, "Capped Seasonality Chart"),
+        normalized_df.to_dict("records"),
+        _cols(normalized_df),
+        "Seasonality updated.",
+        json.dumps(seasonality_store),
     )
 
 
