@@ -213,6 +213,7 @@ def page_forecast_section(slug: str, validation_only: bool = False):
         dcc.Store(id="vs-results-store", storage_type="memory"),
         dcc.Store(id="vs-iq-store", storage_type="memory"),
         dcc.Store(id="vs-iq-summary-store", storage_type="memory"),
+        dcc.Store(id="vs-seasonality-store", storage_type="memory"),
     ]
 
     def _stepper(active_slug: str):
@@ -325,6 +326,61 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                 html.Hr(),
                                 html.H5("Contact Ratio Summary"),
                                 _table("vs-contact-summary", page_size=8),
+                                html.Hr(),
+                                html.H5("Seasonality (Based on Contact Ratio)"),
+                                dcc.Graph(id="vs-seasonality-chart", figure={}, className="mb-2"),
+                                _table("vs-seasonality-table", page_size=6),
+                                html.Hr(),
+                                html.H5("Seasonality Cap Adjustment"),
+                                dbc.Row(
+                                    [
+                                        dbc.Col(
+                                            dbc.InputGroup(
+                                                [
+                                                    dbc.InputGroupText("Lower Cap"),
+                                                    dbc.Input(id="vs-lower-cap", type="number", value=0.8, step=0.05),
+                                                ]
+                                            ),
+                                            md=6,
+                                        ),
+                                        dbc.Col(
+                                            dbc.InputGroup(
+                                                [
+                                                    dbc.InputGroupText("Upper Cap"),
+                                                    dbc.Input(id="vs-upper-cap", type="number", value=1.15, step=0.05),
+                                                ]
+                                            ),
+                                            md=6,
+                                        ),
+                                    ],
+                                    className="g-2",
+                                ),
+                                html.Div("Seasonality Capped Adjustment Table", className="small text-muted mt-2"),
+                                dash_table.DataTable(
+                                    id="vs-capped-editor",
+                                    data=[],
+                                    columns=[],
+                                    page_size=6,
+                                    editable=True,
+                                    style_table={"overflowX": "auto"},
+                                    style_cell={"fontSize": 12},
+                                ),
+                                html.Hr(),
+                                html.H5("Updated Seasonality with Recalculated Avg"),
+                                _table("vs-recalc-table", page_size=6),
+                                dcc.Graph(id="vs-capped-chart", figure={}, className="mb-2"),
+                                html.Hr(),
+                                dbc.InputGroup(
+                                    [
+                                        dbc.InputGroupText("Custom Base Volume"),
+                                        dbc.Input(id="vs-base-volume", type="number", step=1),
+                                    ],
+                                    className="mb-2",
+                                ),
+                                html.H5("Normalized Ratio"),
+                                _table("vs-normalized-table", page_size=6),
+                                dbc.Button("Apply Changes", id="vs-apply-seasonality", color="primary", className="mt-2"),
+                                html.Div(id="vs-seasonality-status", className="small text-muted mt-2"),
                                 html.Hr(),
                                 html.Div(
                                     [
