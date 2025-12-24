@@ -1220,13 +1220,13 @@ def run_phase2_forecast(df: pd.DataFrame, forecast_months: int, config: Optional
 
     # Ensure supported datetime index for downstream models
     try:
-        idx = pd.DatetimeIndex(prepared["ds"])
+        idx = pd.DatetimeIndex(prepared["ds"], name="ds_idx")
         if idx.freq is None:
             inferred = pd.infer_freq(idx)
             if inferred:
-                idx = pd.DatetimeIndex(idx, freq=inferred)
+                idx = pd.DatetimeIndex(idx, freq=inferred, name="ds_idx")
             else:
-                idx = pd.DatetimeIndex(idx.to_period("M").to_timestamp(), freq="MS")
+                idx = pd.DatetimeIndex(idx.to_period("M").to_timestamp(), freq="MS", name="ds_idx")
         prepared = prepared.set_index(idx, drop=False)
     except Exception:
         prepared = prepared.reset_index(drop=True)
