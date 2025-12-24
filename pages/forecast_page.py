@@ -117,14 +117,12 @@ ŷₜ = Σ (wᵢ × yₜ₋ᵢ), where Σ wᵢ = 1
 
 FORECAST_NAV = [
     {"slug": "volume-summary", "label": "Volume Summary", "emoji": "📊"},
-    {"slug": "forecasting", "label": "Forecasting", "emoji": "🔮"},
     {"slug": "transformation-projects", "label": "Transformation Projects", "emoji": "⚙️"},
     {"slug": "daily-interval", "label": "Daily Interval Forecast", "emoji": "⏱️"},
 ]
 
 FORECAST_STEPS = [
-    {"slug": "volume-summary", "label": "Volume Summary", "emoji": "📊", "next": "forecasting"},
-    {"slug": "forecasting", "label": "Forecasting", "emoji": "🔮", "next": "transformation-projects"},
+    {"slug": "volume-summary", "label": "Volume Summary", "emoji": "📊", "next": "transformation-projects"},
     {"slug": "transformation-projects", "label": "Transformation Projects", "emoji": "⚙️", "next": "daily-interval"},
     {"slug": "daily-interval", "label": "Daily Interval Forecast", "emoji": "⏱️", "next": None},
 ]
@@ -216,6 +214,10 @@ def page_forecast_section(slug: str, validation_only: bool = False):
         dcc.Store(id="vs-seasonality-store", storage_type="memory"),
         dcc.Store(id="vs-prophet-store", storage_type="memory"),
         dcc.Store(id="vs-holiday-store", storage_type="memory"),
+        dcc.Store(id="vs-phase1-config-store", storage_type="memory"),
+        dcc.Store(id="vs-phase1-download-store", storage_type="memory"),
+        dcc.Store(id="vs-phase2-store", storage_type="memory"),
+        dcc.Store(id="vs-adjusted-store", storage_type="memory"),
     ]
 
     def _stepper(active_slug: str):
@@ -329,6 +331,18 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                 html.H5("Contact Ratio Summary"),
                                 _table("vs-contact-summary", page_size=8),
                                 html.Hr(),
+                                html.Div(
+                                    [
+                                        html.H5("Forecast group view", className="mb-1"),
+                                        dcc.Dropdown(id="vs-category", options=[], value=None, placeholder="Select category"),
+                                    ],
+                                    className="mb-2",
+                                ),
+                                _table("vs-pivot", page_size=10),
+                                html.Hr(),
+                                html.H5("Volume split (%)"),
+                                _table("vs-volume-split", page_size=10),
+                                html.Hr(),
                                 html.H5("Seasonality (Based on Contact Ratio)"),
                                 dcc.Graph(id="vs-seasonality-chart", figure={}, className="mb-2"),
                                 _table("vs-seasonality-table", page_size=6),
@@ -408,17 +422,114 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                 dbc.Button("Run Phase 1", id="vs-run-phase1", color="success", className="mt-2"),
                                 html.Div(id="vs-phase1-status", className="small text-muted mt-2"),
                                 html.Hr(),
-                                html.Div(
-                                    [
-                                        html.H5("Forecast group view", className="mb-1"),
-                                        dcc.Dropdown(id="vs-category", options=[], value=None, placeholder="Select category"),
-                                    ],
-                                    className="mb-2",
-                                ),
-                                _table("vs-pivot", page_size=10),
+                                html.H5("Phase 1 - Forecast Results"),
+                                _table("vs-phase1-results", page_size=8),
                                 html.Hr(),
-                                html.H5("Volume split (%)"),
-                                _table("vs-volume-split", page_size=10),
+                                html.H5("Phase 1 Accuracy Before Iterations"),
+                                _table("vs-phase1-accuracy", page_size=8),
+                                html.Hr(),
+                                html.H5("Output Iterative Tuning"),
+                                _table("vs-phase1-tuning", page_size=8),
+                                html.Hr(),
+                                html.H5("Final Accuracy (After Tuning)"),
+                                _table("vs-final-accuracy", page_size=8),
+                                html.Hr(),
+                                html.H5("Current Model Configurations"),
+                                html.Div(id="vs-phase1-configs"),
+                                dbc.Button(
+                                    "Download Configuration Summary",
+                                    id="vs-config-download-btn",
+                                    color="secondary",
+                                    className="mt-2",
+                                ),
+                                dcc.Download(id="vs-config-download"),
+                                dbc.Button(
+                                    "Download Phase 1 Results",
+                                    id="vs-phase1-download-btn",
+                                    color="secondary",
+                                    className="mt-2 ms-2",
+                                ),
+                                dcc.Download(id="vs-phase1-download"),
+                                html.Hr(),
+                                html.H5("Phase 2 Forecast"),
+                                dbc.Row(
+                                    [
+                                        dbc.Col(
+                                            dcc.DatePickerSingle(
+                                                id="vs-phase2-start",
+                                                placeholder="Start date",
+                                            ),
+                                            md=6,
+                                        ),
+                                        dbc.Col(
+                                            dcc.DatePickerSingle(
+                                                id="vs-phase2-end",
+                                                placeholder="End date",
+                                            ),
+                                            md=6,
+                                        ),
+                                    ],
+                                    className="g-2 mb-2",
+                                ),
+                                dbc.Button("Run Phase 2 Forecast", id="vs-run-phase2", color="primary"),
+                                dbc.Button(
+                                    "Clear Phase 2 Cache",
+                                    id="vs-clear-phase2",
+                                    color="secondary",
+                                    className="ms-2",
+                                ),
+                                html.Div(id="vs-phase2-status", className="small text-muted mt-2"),
+                                html.Hr(),
+                                html.H5("Phase 2 Contact Ratio Forecast"),
+                                _table("vs-phase2-forecast", page_size=8),
+                                html.Hr(),
+                                html.H5("Phase 2 Base Forecast with Volumes"),
+                                _table("vs-phase2-base", page_size=8),
+                                html.Hr(),
+                                html.H5("Forecast Group Summary"),
+                                _table("vs-phase2-fg-summary", page_size=8),
+                                html.Hr(),
+                                html.H5("Volume Split (%)"),
+                                _table("vs-phase2-volume-split", page_size=8),
+                                html.Hr(),
+                                html.H5("Edit Volume Split Allocation (Latest Year Data)"),
+                                dash_table.DataTable(
+                                    id="vs-volume-split-edit",
+                                    data=[],
+                                    columns=[],
+                                    page_size=8,
+                                    editable=True,
+                                    style_table={"overflowX": "auto"},
+                                    style_cell={"fontSize": 12},
+                                ),
+                                html.Div(id="vs-volume-split-info", className="small text-muted mt-2"),
+                                dbc.Button(
+                                    "Apply Volume Split to Base Forecast",
+                                    id="vs-apply-volume-split",
+                                    color="primary",
+                                    className="mt-2",
+                                ),
+                                html.Hr(),
+                                html.H5("Base Forecast Adjusted by Volume Split"),
+                                _table("vs-adjusted-forecast", page_size=8),
+                                html.Hr(),
+                                html.H5("Verification"),
+                                _table("vs-adjusted-verify", page_size=8),
+                                html.Div(id="vs-adjusted-status", className="small text-muted mt-2"),
+                                dbc.Button(
+                                    "Download Adjusted Forecast by Group",
+                                    id="vs-download-adjusted",
+                                    color="secondary",
+                                    className="mt-2",
+                                ),
+                                dcc.Download(id="vs-download-adjusted-file"),
+                                dbc.Button(
+                                    "Save Monthly Forecast With Adjustments",
+                                    id="vs-save-adjusted",
+                                    color="success",
+                                    className="mt-2 ms-2",
+                                ),
+                                html.Div(id="vs-save-adjusted-status", className="small text-muted mt-2"),
                             ],
                             md=8,
                         ),
@@ -428,11 +539,15 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                 dbc.Modal(
                     [
                         dbc.ModalHeader("Proceed to next step"),
-                        dbc.ModalBody("Volume summary ran successfully. Move to Forecasting?"),
+                        dbc.ModalBody("Volume summary ran successfully. Move to Transformation Projects?"),
                         dbc.ModalFooter(
                             [
                                 dbc.Button("Stay here", id="vs-modal-close", className="me-2"),
-                                dcc.Link(dbc.Button("Go to Forecasting →", color="primary"), href="/forecast/forecasting", style={"textDecoration": "none"}),
+                                dcc.Link(
+                                    dbc.Button("Go to Transformation Projects →", color="primary"),
+                                    href="/forecast/transformation-projects",
+                                    style={"textDecoration": "none"},
+                                ),
                             ]
                         ),
                     ],
@@ -1181,9 +1296,9 @@ def page_forecast_section(slug: str, validation_only: bool = False):
             "slug": "smoothing-anomaly",
             "label": "Smoothing & Anomaly Detection",
             "emoji": "🧹",
-            "next": "forecasting",
+            "next": "transformation-projects",
         }
-        content = _generic_step_layout(step_meta, _smoothing_layout(step_meta), "sa-complete", "forecasting")
+        content = _generic_step_layout(step_meta, _smoothing_layout(step_meta), "sa-complete", "transformation-projects")
         return html.Div(
             dbc.Container(
                 [
@@ -1211,12 +1326,12 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                 html.H1(f"{emoji} {title}", className="forecast-heading"),
                                 dbc.Alert(
                                     "Smoothing & anomaly detection now runs automatically after Volume Summary upload. "
-                                    "Continue directly to Forecasting.",
+                                    "Continue directly to Transformation Projects.",
                                     color="info",
                                 ),
                                 dcc.Link(
-                                    dbc.Button("Go to Forecasting →", color="primary"),
-                                    href="/forecast/forecasting",
+                                    dbc.Button("Go to Transformation Projects →", color="primary"),
+                                    href="/forecast/transformation-projects",
                                     style={"textDecoration": "none"},
                                 ),
                             ],
@@ -1257,7 +1372,22 @@ def page_forecast_section(slug: str, validation_only: bool = False):
     if slug == "volume-summary":
         content = _volume_summary_layout(step_meta)
     elif slug == "forecasting":
-        content = _generic_step_layout(step_meta, _forecasting_layout(step_meta), "fc-complete", next_slug)
+        content = html.Div(
+            [
+                _section_heading(step_meta),
+                dbc.Alert(
+                    "Forecasting step has been merged into Volume Summary. "
+                    "Use Volume Summary to run Phase 1 and Phase 2, then continue to Transformation Projects.",
+                    color="info",
+                ),
+                dcc.Link(
+                    dbc.Button("Go to Volume Summary →", color="primary"),
+                    href="/forecast/volume-summary",
+                    style={"textDecoration": "none"},
+                ),
+            ],
+            className="forecast-page",
+        )
     elif slug == "transformation-projects":
         content = _generic_step_layout(step_meta, _transformation_layout(step_meta), "tp-complete", next_slug)
     elif slug == "daily-interval":
