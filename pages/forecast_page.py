@@ -523,6 +523,7 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                     className="mt-2",
                                 ),
                                 dcc.Download(id="vs-download-adjusted-file"),
+                                dcc.Download(id="vs-save-adjusted-download"),
                                 dbc.Button(
                                     "Save Monthly Forecast With Adjustments",
                                     id="vs-save-adjusted",
@@ -530,29 +531,21 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                     className="mt-2 ms-2",
                                 ),
                                 html.Div(id="vs-save-adjusted-status", className="small text-muted mt-2"),
+                                html.Div(
+                                    dcc.Link(
+                                        dbc.Button("→ Transformation Projects", color="primary"),
+                                        href="/forecast/transformation-projects",
+                                        style={"textDecoration": "none"},
+                                    ),
+                                    id="vs-next-step",
+                                    className="mt-3",
+                                    style={"display": "none"},
+                                ),
                             ],
                             md=8,
                         ),
                     ],
                     className="g-3",
-                ),
-                dbc.Modal(
-                    [
-                        dbc.ModalHeader("Proceed to next step"),
-                        dbc.ModalBody("Volume summary ran successfully. Move to Transformation Projects?"),
-                        dbc.ModalFooter(
-                            [
-                                dbc.Button("Stay here", id="vs-modal-close", className="me-2"),
-                                dcc.Link(
-                                    dbc.Button("Go to Transformation Projects →", color="primary"),
-                                    href="/forecast/transformation-projects",
-                                    style={"textDecoration": "none"},
-                                ),
-                            ]
-                        ),
-                    ],
-                    id="vs-next-modal",
-                    is_open=False,
                 ),
             ],
             className="forecast-page",
