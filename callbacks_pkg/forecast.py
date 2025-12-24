@@ -7,7 +7,7 @@ import logging
 from typing import Any, Optional, Tuple
 from prophet import Prophet
 import dash
-from dash import Input, Output, State, no_update, dcc, html
+from dash import Input, Output, State, no_update, dcc, html, dash_table
 import dash_bootstrap_components as dbc
 import pandas as pd
 import plotly.express as px
@@ -26,11 +26,21 @@ from forecasting.process_and_IQ_data import (
     accuracy_phase1,
     fill_final_smoothed_row,
     create_download_csv_with_metadata,
+    unpivot_iq_summary,
+    map_original_volume_to_phase2_forecast,
+    map_normalized_volume_to_forecast,
+    fmt_percent1,
+    fmt_millions_1,
     clean_and_convert_percentage,
     clean_and_convert_millions,
     add_editable_base_volume,
 )
-from forecasting.contact_ratio_dash import run_contact_ratio_forecast, run_phase2_forecast
+from forecasting.contact_ratio_dash import (
+    run_contact_ratio_forecast,
+    run_phase2_forecast,
+    iterative_tuning,
+    train_and_evaluate_func,
+)
 import config_manager
 import os
 
@@ -1807,9 +1817,32 @@ def _run_prophet_smoothing(n_clicks, seasonality_store, iq_summary_store, cat, h
         best_params, best_score = _prophet_cv_best(df_long, holiday_df, regressors)
         pred = _prophet_fit_full(df_long, best_params, regressors, holiday_df)
 
-        df_long["Final_Smoothed_Value"] = pred["yhat"].values.round(4)
+        df_long["Normalized_Ratio_Post_Prophet"] = pred["yhat"].values.round(4)
+        df_long["Normalized_Volume"] = (
+            pd.to_numeric(df_long["Normalized_Ratio_Post_Prophet"], errors="coerce")
+            * pd.to_numeric(df_long["IQ_value"], errors="coerce")
+        ).round(4)
+        df_long["Final_Smoothed_Value"] = df_long["Normalized_Ratio_Post_Prophet"].round(4)
         df_long["Year"] = df_long["ds"].dt.year
         df_long["Month"] = df_long["ds"].dt.strftime("%b")
+        df_long["Month_Year"] = df_long["ds"].dt.strftime("%b-%Y")
+        if "Original_Contact_Ratio" in df_long.columns:
+            df_long["Contact_Ratio"] = df_long["Original_Contact_Ratio"]
+        else:
+            df_long["Contact_Ratio"] = np.nan
+        df_long["IQ_Value_Scaled"] = df_long["IQ_value_scaled"]
+        holiday_name_map = {}
+        if holiday_df is not None and not holiday_df.empty and "ds" in holiday_df.columns:
+            holiday_df = holiday_df.copy()
+            holiday_df["Month_Year"] = pd.to_datetime(holiday_df["ds"], errors="coerce").dt.strftime("%b-%Y")
+            name_col = "holiday" if "holiday" in holiday_df.columns else None
+            if name_col:
+                holiday_name_map = (
+                    holiday_df.groupby("Month_Year")[name_col]
+                    .apply(lambda x: ", ".join(sorted({str(v) for v in x if str(v).strip()})))
+                    .to_dict()
+                )
+        df_long["Holiday_Name"] = df_long["Month_Year"].map(holiday_name_map).fillna("")
 
         norm2_pivot = (
             df_long.pivot_table(index="Year", columns="Month", values="Final_Smoothed_Value")
@@ -1828,11 +1861,20 @@ def _run_prophet_smoothing(n_clicks, seasonality_store, iq_summary_store, cat, h
         )
         line_fig.update_layout(title="Prophet Smoothing", xaxis_title="Month", yaxis_title="Value")
 
-        table_cols = ["ds", "Normalized_Ratio_1", "Final_Smoothed_Value", "IQ_value"]
-        if "Original_Contact_Ratio" in df_long.columns:
-            table_cols.insert(2, "Original_Contact_Ratio")
+        table_cols = [
+            "Year",
+            "Month",
+            "Contact_Ratio",
+            "Month_Year",
+            "Holiday_Name",
+            "Normalized_Ratio_1",
+            "IQ_Value_Scaled",
+            "Normalized_Ratio_Post_Prophet",
+            "Normalized_Volume",
+            "Final_Smoothed_Value",
+        ]
         table_df = df_long[table_cols].copy()
-        table_df["ds"] = pd.to_datetime(table_df["ds"]).dt.strftime("%Y-%m-%d")
+        table_df = table_df.rename(columns={"Normalized_Ratio_1": "Normalized Ratio 1"})
         columns = []
         for col in table_df.columns:
             columns.append({"name": col, "id": col, "editable": col == "Final_Smoothed_Value"})
@@ -1890,6 +1932,27 @@ def _save_prophet_changes(n_clicks, table_rows, prophet_store):
     if orig_df.empty or new_df.empty:
         return "No data to save.", no_update, no_update, no_update, no_update
 
+    def _ensure_ds(df_in: pd.DataFrame) -> pd.DataFrame:
+        df_work = df_in.copy()
+        if "ds" in df_work.columns and df_work["ds"].notna().any():
+            df_work["ds"] = pd.to_datetime(df_work["ds"], errors="coerce")
+            return df_work
+        if "Month_Year" in df_work.columns:
+            df_work["ds"] = pd.to_datetime(df_work["Month_Year"], format="%b-%Y", errors="coerce")
+            if df_work["ds"].isna().all():
+                df_work["ds"] = pd.to_datetime(df_work["Month_Year"], errors="coerce")
+            return df_work
+        if "Year" in df_work.columns and "Month" in df_work.columns:
+            month_num = df_work["Month"].apply(_month_name_to_num)
+            date_str = (
+                df_work["Year"].astype(str)
+                + "-"
+                + month_num.astype("Int64").astype(str).str.zfill(2)
+                + "-01"
+            )
+            df_work["ds"] = pd.to_datetime(date_str, errors="coerce")
+        return df_work
+
     changed = False
     if "Final_Smoothed_Value" in new_df.columns:
         try:
@@ -1901,7 +1964,7 @@ def _save_prophet_changes(n_clicks, table_rows, prophet_store):
         except Exception:
             changed = True
 
-    new_df["ds"] = pd.to_datetime(new_df["ds"], errors="coerce")
+    new_df = _ensure_ds(new_df)
     new_df["Year"] = new_df["ds"].dt.year
     new_df["Month"] = new_df["ds"].dt.strftime("%b")
     norm2_pivot = (
@@ -1935,6 +1998,16 @@ def _save_prophet_changes(n_clicks, table_rows, prophet_store):
 
 @app.callback(
     Output("vs-phase1-status", "children"),
+    Output("vs-phase1-results", "data"),
+    Output("vs-phase1-results", "columns"),
+    Output("vs-phase1-accuracy", "data"),
+    Output("vs-phase1-accuracy", "columns"),
+    Output("vs-phase1-tuning", "data"),
+    Output("vs-phase1-tuning", "columns"),
+    Output("vs-final-accuracy", "data"),
+    Output("vs-final-accuracy", "columns"),
+    Output("vs-phase1-config-store", "data"),
+    Output("vs-phase1-download-store", "data"),
     Output("forecast-phase-store", "data", allow_duplicate=True),
     Input("vs-run-phase1", "n_clicks"),
     State("vs-prophet-store", "data"),
@@ -1946,16 +2019,30 @@ def _run_phase1_from_volume(n_clicks, prophet_store, phase_store, holiday_store)
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
     if not prophet_store:
-        return "Run Prophet smoothing first.", phase_store
+        return "Run Prophet smoothing first.", [], [], [], [], [], [], [], [], None, None, phase_store
 
     payload = _normalize_phase_store(prophet_store)
     prophet_json = payload.get("prophet_table") if isinstance(payload, dict) else None
     if not prophet_json:
-        return "Prophet data missing.", phase_store
+        return "Prophet data missing.", [], [], [], [], [], [], [], [], None, None, phase_store
     df = pd.read_json(io.StringIO(prophet_json), orient="split")
     if df.empty:
-        return "Prophet data missing.", phase_store
-    df["ds"] = pd.to_datetime(df["ds"], errors="coerce")
+        return "Prophet data missing.", [], [], [], [], [], [], [], [], None, None, phase_store
+    if "ds" in df.columns:
+        df["ds"] = pd.to_datetime(df["ds"], errors="coerce")
+    elif "Month_Year" in df.columns:
+        df["ds"] = pd.to_datetime(df["Month_Year"], format="%b-%Y", errors="coerce")
+        if df["ds"].isna().all():
+            df["ds"] = pd.to_datetime(df["Month_Year"], errors="coerce")
+    elif "Year" in df.columns and "Month" in df.columns:
+        month_num = df["Month"].apply(_month_name_to_num)
+        date_str = (
+            df["Year"].astype(str)
+            + "-"
+            + month_num.astype("Int64").astype(str).str.zfill(2)
+            + "-01"
+        )
+        df["ds"] = pd.to_datetime(date_str, errors="coerce")
     df["Final_Smoothed_Value"] = pd.to_numeric(df["Final_Smoothed_Value"], errors="coerce")
     df["y"] = df["Final_Smoothed_Value"] / 100
 
@@ -1996,6 +2083,93 @@ def _run_phase1_from_volume(n_clicks, prophet_store, phase_store, holiday_store)
             f"Test Period: {test['ds'].min().strftime('%b %Y')} to {test['ds'].max().strftime('%b %Y')} ({len(test)} months)"
         )
     results = forecast_res.get("forecast_results", {})
+    combined = pd.DataFrame()
+    wide = pd.DataFrame()
+    pivot_smoothed = pd.DataFrame()
+    accuracy_tbl = pd.DataFrame()
+    tuning_tbl = pd.DataFrame()
+    final_accuracy_tbl = pd.DataFrame()
+    tuned_config = config
+    download_csv = None
+
+    if results:
+        results_with_smoothed = dict(results)
+        smoothed_vals = forecast_res.get("final_smoothed_values")
+        if smoothed_vals is not None:
+            results_with_smoothed["final_smoothed_values"] = smoothed_vals
+        combined, wide, pivot_smoothed = process_forecast_results(results_with_smoothed)
+        if not wide.empty and not pivot_smoothed.empty:
+            wide = fill_final_smoothed_row(wide.copy(), pivot_smoothed)
+        if not wide.empty and not pivot_smoothed.empty:
+            try:
+                accuracy_tbl = accuracy_phase1(wide, pivot_smoothed)
+            except Exception:
+                accuracy_tbl = pd.DataFrame()
+
+    def _config_table(cfg: dict) -> pd.DataFrame:
+        rows = []
+        for model_name, params in (cfg or {}).items():
+            if not isinstance(params, dict):
+                continue
+            for key, val in params.items():
+                if isinstance(val, (dict, list, tuple)):
+                    val = json.dumps(val)
+                rows.append({"Model": model_name, "Parameter": key, "Value": val})
+        return pd.DataFrame(rows)
+
+    forecast_horizon = len(test) if not test.empty else 0
+    if not train.empty and forecast_horizon > 0:
+        try:
+            actual_data = df[["ds", "y"]].dropna()
+            initial_accuracy_df, _, _ = train_and_evaluate_func(
+                config,
+                train,
+                actual_data,
+                forecast_horizon,
+                show_details=False,
+            )
+            tuned_config, _acc_before, tuned_accuracy_df = iterative_tuning(
+                config,
+                initial_accuracy_df,
+                train_and_evaluate_func,
+                train,
+                forecast_horizon,
+                actual_data,
+            )
+            tuning_tbl = _config_table(tuned_config)
+            final_accuracy_tbl = tuned_accuracy_df.copy() if tuned_accuracy_df is not None else pd.DataFrame()
+
+            tuned_forecast = run_contact_ratio_forecast(
+                df,
+                forecast_horizon,
+                holiday_mapping=None,
+                holiday_original_date=holiday_df,
+                config=tuned_config,
+            )
+            tuned_results = tuned_forecast.get("forecast_results", {})
+            if tuned_results:
+                tuned_with_smoothed = dict(tuned_results)
+                tuned_smoothed_vals = tuned_forecast.get("final_smoothed_values")
+                if tuned_smoothed_vals is not None:
+                    tuned_with_smoothed["final_smoothed_values"] = tuned_smoothed_vals
+                combined_tuned, wide_tuned, pivot_tuned = process_forecast_results(tuned_with_smoothed)
+                if not wide_tuned.empty and not pivot_tuned.empty:
+                    wide_tuned = fill_final_smoothed_row(wide_tuned.copy(), pivot_tuned)
+                if not wide_tuned.empty and not pivot_tuned.empty:
+                    final_accuracy_tbl = accuracy_phase1(wide_tuned, pivot_tuned)
+                if not wide_tuned.empty:
+                    download_csv = create_download_csv_with_metadata(wide_tuned, tuned_config)
+        except Exception:
+            logger.exception("vs-phase1: tuning failed")
+
+    if final_accuracy_tbl.empty:
+        final_accuracy_tbl = accuracy_tbl.copy()
+
+    if download_csv is None and not wide.empty:
+        try:
+            download_csv = create_download_csv_with_metadata(wide, tuned_config)
+        except Exception:
+            download_csv = None
     if results:
         status_lines.append("Prophet Forecast Done" if results.get("prophet") is not None else "Prophet Forecast Failed")
         status_lines.append("RF Forecast Done" if results.get("random_forest") is not None else "RF Forecast Failed")
@@ -2011,7 +2185,549 @@ def _run_phase1_from_volume(n_clicks, prophet_store, phase_store, holiday_store)
     )
     phase_data["phase1_meta"] = {"source": "prophet-volume-summary", "ts": pd.Timestamp.utcnow().isoformat()}
 
-    return html.Ul([html.Li(line) for line in status_lines]), phase_data
+    config_store = json.dumps(tuned_config)
+    return (
+        html.Ul([html.Li(line) for line in status_lines]),
+        combined.to_dict("records") if not combined.empty else [],
+        _cols(combined) if not combined.empty else [],
+        accuracy_tbl.to_dict("records") if isinstance(accuracy_tbl, pd.DataFrame) and not accuracy_tbl.empty else [],
+        _cols(accuracy_tbl) if isinstance(accuracy_tbl, pd.DataFrame) and not accuracy_tbl.empty else [],
+        tuning_tbl.to_dict("records") if not tuning_tbl.empty else [],
+        _cols(tuning_tbl) if not tuning_tbl.empty else [],
+        final_accuracy_tbl.to_dict("records") if isinstance(final_accuracy_tbl, pd.DataFrame) and not final_accuracy_tbl.empty else [],
+        _cols(final_accuracy_tbl) if isinstance(final_accuracy_tbl, pd.DataFrame) and not final_accuracy_tbl.empty else [],
+        config_store,
+        download_csv,
+        phase_data,
+    )
+
+
+@app.callback(
+    Output("vs-phase1-configs", "children"),
+    Input("vs-phase1-config-store", "data"),
+)
+def _render_phase1_configs(config_json):
+    if not config_json:
+        return html.Div("Run Phase 1 to view model configurations.", className="small text-muted")
+    try:
+        cfg = json.loads(config_json) if isinstance(config_json, str) else config_json
+    except Exception:
+        return html.Div("Could not parse configuration data.", className="small text-muted")
+    if not isinstance(cfg, dict) or not cfg:
+        return html.Div("No configuration data found.", className="small text-muted")
+
+    items = []
+    for model_name, params in cfg.items():
+        if not isinstance(params, dict):
+            continue
+        rows = []
+        for key, val in params.items():
+            if isinstance(val, (dict, list, tuple)):
+                val = json.dumps(val)
+            rows.append({"Parameter": key, "Value": val})
+        df = pd.DataFrame(rows)
+        table = dash_table.DataTable(
+            data=df.to_dict("records"),
+            columns=_cols(df),
+            page_size=8,
+            style_table={"overflowX": "auto"},
+            style_cell={"fontSize": 12, "padding": "6px 8px"},
+            style_header={"fontWeight": "600"},
+        )
+        items.append(dbc.AccordionItem(table, title=str(model_name)))
+
+    if not items:
+        return html.Div("No model configuration tables to display.", className="small text-muted")
+
+    return dbc.Accordion(items, always_open=True, flush=True, start_collapsed=True)
+
+
+@app.callback(
+    Output("vs-config-download", "data"),
+    Input("vs-config-download-btn", "n_clicks"),
+    State("vs-phase1-config-store", "data"),
+    prevent_initial_call=True,
+)
+def _download_phase1_config(n_clicks, config_json):
+    if not n_clicks or not config_json:
+        raise dash.exceptions.PreventUpdate
+    try:
+        cfg = json.loads(config_json) if isinstance(config_json, str) else config_json
+    except Exception:
+        raise dash.exceptions.PreventUpdate
+
+    rows = []
+    for model_name, params in (cfg or {}).items():
+        if not isinstance(params, dict):
+            continue
+        for key, val in params.items():
+            if isinstance(val, (dict, list, tuple)):
+                val = json.dumps(val)
+            rows.append({"Model": model_name, "Parameter": key, "Value": val})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        raise dash.exceptions.PreventUpdate
+    return dcc.send_data_frame(df.to_csv, "phase1_config_summary.csv", index=False)
+
+
+@app.callback(
+    Output("vs-phase1-download", "data"),
+    Input("vs-phase1-download-btn", "n_clicks"),
+    State("vs-phase1-download-store", "data"),
+    prevent_initial_call=True,
+)
+def _download_phase1_results(n_clicks, csv_text):
+    if not n_clicks or not csv_text:
+        raise dash.exceptions.PreventUpdate
+    return dcc.send_string(lambda: csv_text, "phase1_results_with_config.csv")
+
+
+@app.callback(
+    Output("vs-phase2-status", "children"),
+    Output("vs-phase2-forecast", "data"),
+    Output("vs-phase2-forecast", "columns"),
+    Output("vs-phase2-base", "data"),
+    Output("vs-phase2-base", "columns"),
+    Output("vs-phase2-fg-summary", "data"),
+    Output("vs-phase2-fg-summary", "columns"),
+    Output("vs-phase2-volume-split", "data"),
+    Output("vs-phase2-volume-split", "columns"),
+    Output("vs-volume-split-edit", "data"),
+    Output("vs-volume-split-edit", "columns"),
+    Output("vs-volume-split-info", "children"),
+    Output("vs-phase2-store", "data"),
+    Output("vs-adjusted-forecast", "data", allow_duplicate=True),
+    Output("vs-adjusted-forecast", "columns", allow_duplicate=True),
+    Output("vs-adjusted-verify", "data", allow_duplicate=True),
+    Output("vs-adjusted-verify", "columns", allow_duplicate=True),
+    Output("vs-adjusted-status", "children", allow_duplicate=True),
+    Output("vs-adjusted-store", "data", allow_duplicate=True),
+    Output("vs-save-adjusted-status", "children", allow_duplicate=True),
+    Input("vs-run-phase2", "n_clicks"),
+    Input("vs-clear-phase2", "n_clicks"),
+    State("vs-phase2-start", "date"),
+    State("vs-phase2-end", "date"),
+    State("vs-prophet-store", "data"),
+    State("vs-phase1-config-store", "data"),
+    State("vs-results-store", "data"),
+    State("vs-iq-summary-store", "data"),
+    State("vs-category", "value"),
+    prevent_initial_call=True,
+)
+def _run_phase2_from_volume(
+    n_clicks,
+    n_clear,
+    start_date,
+    end_date,
+    prophet_store,
+    config_store,
+    results_store,
+    iq_summary_store,
+    cat,
+):
+    ctx = dash.callback_context
+    trigger = ctx.triggered_id if ctx.triggered_id else None
+
+    def _empty_phase2(status_text: str):
+        return (
+            status_text,
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            "",
+            None,
+            [],
+            [],
+            [],
+            [],
+            "",
+            None,
+            "",
+        )
+
+    if trigger == "vs-clear-phase2":
+        return _empty_phase2("Phase 2 cache cleared.")
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    if not start_date or not end_date:
+        return _empty_phase2("Select start and end dates for Phase 2.")
+
+    try:
+        start = pd.to_datetime(start_date).to_period("M").to_timestamp()
+        end = pd.to_datetime(end_date).to_period("M").to_timestamp()
+    except Exception:
+        return _empty_phase2("Invalid dates for Phase 2.")
+    if end < start:
+        return _empty_phase2("End date must be after start date.")
+    forecast_months = (end.year - start.year) * 12 + (end.month - start.month) + 1
+
+    if not prophet_store:
+        return _empty_phase2("Run Phase 1 first to generate smoothing data.")
+
+    payload = _normalize_phase_store(prophet_store)
+    prophet_json = payload.get("prophet_table") if isinstance(payload, dict) else None
+    if not prophet_json:
+        return _empty_phase2("Prophet smoothing data not found.")
+
+    df_smooth = pd.read_json(io.StringIO(prophet_json), orient="split")
+    if df_smooth.empty:
+        return _empty_phase2("Prophet smoothing data is empty.")
+
+    if "ds" in df_smooth.columns:
+        df_smooth["ds"] = pd.to_datetime(df_smooth["ds"], errors="coerce")
+    elif "Month_Year" in df_smooth.columns:
+        df_smooth["ds"] = pd.to_datetime(df_smooth["Month_Year"], format="%b-%Y", errors="coerce")
+        if df_smooth["ds"].isna().all():
+            df_smooth["ds"] = pd.to_datetime(df_smooth["Month_Year"], errors="coerce")
+    elif "Year" in df_smooth.columns and "Month" in df_smooth.columns:
+        month_num = df_smooth["Month"].apply(_month_name_to_num)
+        date_str = (
+            df_smooth["Year"].astype(str)
+            + "-"
+            + month_num.astype("Int64").astype(str).str.zfill(2)
+            + "-01"
+        )
+        df_smooth["ds"] = pd.to_datetime(date_str, errors="coerce")
+
+    df_smooth["Final_Smoothed_Value"] = pd.to_numeric(df_smooth.get("Final_Smoothed_Value"), errors="coerce")
+
+    iq_df, vol_df, _ = _iq_tables_from_store(iq_summary_store, cat or "")
+    iq_long = unpivot_iq_summary(iq_df.copy()) if iq_df is not None and not iq_df.empty else pd.DataFrame()
+    if not iq_long.empty:
+        iq_long["Year"] = iq_long["Year"].astype(int)
+        iq_long["Month"] = iq_long["Month"].astype(str).str.strip()
+        df_smooth["Year"] = df_smooth["ds"].dt.year
+        df_smooth["Month"] = df_smooth["ds"].dt.strftime("%b")
+        df_smooth = df_smooth.merge(iq_long, on=["Year", "Month"], how="left")
+    if "IQ_value" not in df_smooth.columns or df_smooth["IQ_value"].isna().all():
+        if "Normalized_Volume" in df_smooth.columns and "Normalized_Ratio_Post_Prophet" in df_smooth.columns:
+            denom = pd.to_numeric(df_smooth["Normalized_Ratio_Post_Prophet"], errors="coerce").replace(0, np.nan)
+            df_smooth["IQ_value"] = pd.to_numeric(df_smooth["Normalized_Volume"], errors="coerce") / denom
+        else:
+            df_smooth["IQ_value"] = 1.0
+
+    cfg = config_manager.load_config()
+    if config_store:
+        try:
+            cfg = json.loads(config_store) if isinstance(config_store, str) else config_store
+        except Exception:
+            cfg = config_manager.load_config()
+
+    phase2_res = run_phase2_forecast(df_smooth, forecast_months, config=cfg)
+    forecast_results = phase2_res.get("forecast_results", {})
+    if not forecast_results:
+        return _empty_phase2("Phase 2 forecast failed to produce results.")
+
+    combined, wide, pivot_smoothed = process_forecast_results(forecast_results)
+    if combined.empty:
+        return _empty_phase2("Phase 2 forecast returned no rows.")
+
+    combined["ds"] = pd.to_datetime(combined["Month_Year"], format="%b-%y", errors="coerce")
+    combined["Year"] = combined["ds"].dt.year
+    combined["Month"] = combined["ds"].dt.strftime("%b")
+
+    merged_df = combined.copy()
+    if not iq_long.empty:
+        merged_df = merged_df.merge(iq_long, on=["Year", "Month"], how="left")
+    merged_df["IQ_value"] = pd.to_numeric(merged_df.get("IQ_value"), errors="coerce")
+    merged_df["Forecast"] = pd.to_numeric(merged_df.get("Forecast"), errors="coerce")
+    merged_df["Base_Forecast_Category"] = (
+        merged_df["Forecast"] * merged_df["IQ_value"] / 1_000_000
+    ).round().astype("Int64")
+    merged_df["Contact_Ratio_Forecast_Category"] = merged_df["Forecast"].apply(fmt_percent1)
+    merged_df["IQ_value_Category"] = merged_df["IQ_value"].apply(fmt_millions_1)
+
+    volume_long = pd.DataFrame()
+    if vol_df is not None and not vol_df.empty:
+        month_cols = [c for c in vol_df.columns if c != "Year"]
+        volume_long = vol_df.melt(id_vars="Year", value_vars=month_cols, var_name="Month", value_name="volume")
+        volume_long["Year"] = pd.to_numeric(volume_long["Year"], errors="coerce")
+        volume_long["Month"] = volume_long["Month"].astype(str).str.strip()
+        volume_long["volume"] = (
+            volume_long["volume"].astype(str).str.replace(",", "", regex=False).str.strip()
+        )
+
+        def _parse_vol(x):
+            if x is None:
+                return None
+            s = str(x).lower()
+            try:
+                if s.endswith("k"):
+                    return float(s[:-1]) * 1000
+                if s.endswith("m"):
+                    return float(s[:-1]) * 1_000_000
+                return float(s)
+            except Exception:
+                return None
+
+        volume_long["volume"] = volume_long["volume"].apply(_parse_vol)
+        volume_long = volume_long.dropna(subset=["Year", "Month", "volume"])
+        volume_long = volume_long.rename(columns={"Year": "year", "Month": "month"})
+
+    base_df = merged_df.copy()
+    if not volume_long.empty:
+        base_df = map_original_volume_to_phase2_forecast(base_df, volume_long)
+    smoothing_norm = pd.DataFrame()
+    if "Normalized_Volume" in df_smooth.columns:
+        smoothing_norm = df_smooth.copy()
+        smoothing_norm["Year"] = smoothing_norm["ds"].dt.year
+        smoothing_norm["Month"] = smoothing_norm["ds"].dt.strftime("%b")
+        smoothing_norm = smoothing_norm[["Year", "Month", "Normalized_Volume"]]
+    if not smoothing_norm.empty:
+        base_df = map_normalized_volume_to_forecast(base_df, smoothing_norm)
+
+    if "volume" in base_df.columns:
+        base_df = base_df.rename(columns={"volume": "Original_volume"})
+    base_df["Original_volume_Category"] = pd.to_numeric(base_df.get("Original_volume"), errors="coerce")
+    base_df["Normalized_Volume_Category"] = pd.to_numeric(base_df.get("Normalized_Volume"), errors="coerce")
+
+    base_cols = [
+        "Year",
+        "Month",
+        "Model",
+        "Contact_Ratio_Forecast_Category",
+        "IQ_value_Category",
+        "Base_Forecast_Category",
+        "Original_volume_Category",
+        "Normalized_Volume_Category",
+    ]
+    base_display = base_df[[c for c in base_cols if c in base_df.columns]].copy()
+
+    fg_summary = pd.DataFrame()
+    fg_split = pd.DataFrame()
+    volume_split_edit = pd.DataFrame()
+    volume_split_info = ""
+    if results_store and cat:
+        try:
+            rs_payload = json.loads(results_store) if isinstance(results_store, str) else results_store
+            data_json = rs_payload.get("data")
+        except Exception:
+            data_json = None
+        if data_json:
+            df_norm = pd.read_json(io.StringIO(data_json), orient="split")
+            try:
+                fg_summary, fg_split, _, _, _ = forecast_group_pivot_and_long_style(df_norm, cat)
+            except Exception:
+                fg_summary, fg_split = _fallback_pivots(df_norm, cat)
+
+    if fg_split is not None and not fg_split.empty:
+        split_clean = fg_split.copy()
+        split_clean = split_clean[split_clean["Year"] != "--------"].copy() if "Year" in split_clean.columns else split_clean
+        split_clean["Year_Numeric"] = pd.to_numeric(split_clean["Year"], errors="coerce")
+        latest_data = split_clean.groupby("forecast_group").apply(
+            lambda x: x.loc[x["Year_Numeric"].idxmax()]
+        ).reset_index(drop=True)
+        if "Vol_Split_Last_3M" in latest_data.columns:
+            latest_data["Vol_Split_Last_3M_Numeric"] = (
+                latest_data["Vol_Split_Last_3M"].astype(str).str.replace("%", "", regex=False)
+            )
+            latest_data["Vol_Split_Last_3M_Numeric"] = pd.to_numeric(
+                latest_data["Vol_Split_Last_3M_Numeric"], errors="coerce"
+            )
+        else:
+            latest_data["Vol_Split_Last_3M_Numeric"] = 0.0
+        total_original = latest_data["Vol_Split_Last_3M_Numeric"].sum()
+        if total_original > 0:
+            latest_data["Vol_Split_Normalized"] = (
+                latest_data["Vol_Split_Last_3M_Numeric"] / total_original * 100
+            ).round(1)
+        else:
+            latest_data["Vol_Split_Normalized"] = 0.0
+        volume_split_edit = latest_data[
+            ["forecast_group", "Year", "Vol_Split_Last_3M_Numeric", "Vol_Split_Normalized"]
+        ].copy()
+        volume_split_info = (
+            f"Volume Split% last 3 Months total: {total_original:.1f}% | "
+            f"Final normalized: {volume_split_edit['Vol_Split_Normalized'].sum():.1f}%"
+        )
+
+    edit_cols = [
+        {"name": "Forecast Group", "id": "forecast_group", "editable": False},
+        {"name": "Year", "id": "Year", "editable": False},
+        {"name": "Vol_Split_Last_3M_Numeric", "id": "Vol_Split_Last_3M_Numeric", "editable": False},
+        {"name": "Vol_Split_Normalized", "id": "Vol_Split_Normalized", "editable": True},
+    ]
+
+    store_payload = {
+        "base_df": base_df.to_json(date_format="iso", orient="split"),
+        "forecast_group_split": fg_split.to_json(date_format="iso", orient="split") if fg_split is not None else None,
+        "volume_split_edit": volume_split_edit.to_json(date_format="iso", orient="split")
+        if not volume_split_edit.empty
+        else None,
+    }
+
+    return (
+        f"Phase 2 forecast ready ({forecast_months} months).",
+        combined.to_dict("records"),
+        _cols(combined),
+        base_display.to_dict("records"),
+        _cols(base_display),
+        fg_summary.to_dict("records") if fg_summary is not None and not fg_summary.empty else [],
+        _cols(fg_summary) if fg_summary is not None and not fg_summary.empty else [],
+        fg_split.to_dict("records") if fg_split is not None and not fg_split.empty else [],
+        _cols(fg_split) if fg_split is not None and not fg_split.empty else [],
+        volume_split_edit.to_dict("records") if not volume_split_edit.empty else [],
+        edit_cols if not volume_split_edit.empty else [],
+        volume_split_info,
+        json.dumps(store_payload),
+        [],
+        [],
+        [],
+        [],
+        "",
+        None,
+        "",
+    )
+
+
+@app.callback(
+    Output("vs-adjusted-forecast", "data", allow_duplicate=True),
+    Output("vs-adjusted-forecast", "columns", allow_duplicate=True),
+    Output("vs-adjusted-verify", "data", allow_duplicate=True),
+    Output("vs-adjusted-verify", "columns", allow_duplicate=True),
+    Output("vs-adjusted-status", "children", allow_duplicate=True),
+    Output("vs-adjusted-store", "data", allow_duplicate=True),
+    Input("vs-apply-volume-split", "n_clicks"),
+    State("vs-volume-split-edit", "data"),
+    State("vs-phase2-store", "data"),
+    prevent_initial_call=True,
+)
+def _apply_volume_split(n_clicks, split_rows, phase2_store):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    if not phase2_store:
+        return [], [], [], [], "Run Phase 2 first.", None
+
+    try:
+        payload = json.loads(phase2_store) if isinstance(phase2_store, str) else phase2_store
+        base_json = payload.get("base_df")
+    except Exception:
+        base_json = None
+    if not base_json:
+        return [], [], [], [], "Phase 2 base forecast missing.", None
+    base_df = pd.read_json(io.StringIO(base_json), orient="split")
+    if base_df.empty:
+        return [], [], [], [], "Phase 2 base forecast missing.", None
+
+    split_df = pd.DataFrame(split_rows) if split_rows else pd.DataFrame()
+    if split_df.empty or "forecast_group" not in split_df.columns:
+        return [], [], [], [], "Volume split data missing.", None
+
+    split_df["Vol_Split_Normalized"] = pd.to_numeric(split_df["Vol_Split_Normalized"], errors="coerce").fillna(0.0)
+    total_norm = split_df["Vol_Split_Normalized"].sum()
+    if total_norm > 0:
+        split_df["Vol_Split_Final"] = (split_df["Vol_Split_Normalized"] / total_norm * 100).round(1)
+    else:
+        split_df["Vol_Split_Final"] = 0.0
+
+    mapping = dict(zip(split_df["forecast_group"], split_df["Vol_Split_Final"] / 100.0))
+
+    adjusted_results = []
+    for fg, split_pct in mapping.items():
+        fg_forecast = base_df.copy()
+        fg_forecast["forecast_group"] = fg
+        fg_forecast["Volume_Split_%Fg"] = split_pct * 100
+        fg_forecast["Base_Forecast_for_Forecast_Group"] = (
+            pd.to_numeric(fg_forecast["Base_Forecast_Category"], errors="coerce") * split_pct
+        ).round().astype("Int64")
+        adjusted_results.append(fg_forecast)
+
+    adjusted_df = pd.concat(adjusted_results, ignore_index=True) if adjusted_results else pd.DataFrame()
+    if adjusted_df.empty:
+        return [], [], [], [], "No adjusted forecast generated.", None
+
+    verify_df = adjusted_df.groupby(["Year", "Month", "Model"], as_index=False).agg(
+        Base_Forecast_Category=("Base_Forecast_Category", "first"),
+        Base_Forecast_for_Forecast_Group=("Base_Forecast_for_Forecast_Group", "sum"),
+    )
+    verify_df["Difference"] = (
+        verify_df["Base_Forecast_for_Forecast_Group"] - verify_df["Base_Forecast_Category"]
+    )
+
+    display_cols = [
+        "Year",
+        "Month",
+        "Model",
+        "forecast_group",
+        "Volume_Split_%Fg",
+        "Base_Forecast_Category",
+        "Base_Forecast_for_Forecast_Group",
+        "Original_volume_Category",
+        "Normalized_Volume_Category",
+    ]
+    adjusted_display = adjusted_df[[c for c in display_cols if c in adjusted_df.columns]].copy()
+    adjusted_store = adjusted_df.to_json(date_format="iso", orient="split")
+    status = "Volume Split Applied successfully to base forecast."
+    return (
+        adjusted_display.to_dict("records"),
+        _cols(adjusted_display),
+        verify_df.to_dict("records"),
+        _cols(verify_df),
+        status,
+        adjusted_store,
+    )
+
+
+@app.callback(
+    Output("vs-download-adjusted-file", "data"),
+    Input("vs-download-adjusted", "n_clicks"),
+    State("vs-adjusted-store", "data"),
+    prevent_initial_call=True,
+)
+def _download_adjusted_forecast(n_clicks, adjusted_json):
+    if not n_clicks or not adjusted_json:
+        raise dash.exceptions.PreventUpdate
+    df = pd.read_json(io.StringIO(adjusted_json), orient="split")
+    if df.empty:
+        raise dash.exceptions.PreventUpdate
+    return dcc.send_data_frame(df.to_csv, "adjusted_forecast_by_group.csv", index=False)
+
+
+@app.callback(
+    Output("vs-save-adjusted-status", "children", allow_duplicate=True),
+    Input("vs-save-adjusted", "n_clicks"),
+    State("vs-adjusted-store", "data"),
+    prevent_initial_call=True,
+)
+def _save_adjusted_to_db(n_clicks, adjusted_json):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    if not adjusted_json:
+        return "No adjusted forecast to save."
+    try:
+        df = pd.read_json(io.StringIO(adjusted_json), orient="split")
+    except Exception as exc:
+        return f"Could not parse adjusted forecast: {exc}"
+    if df.empty:
+        return "Adjusted forecast is empty."
+    try:
+        user = current_user_fallback() or "unknown"
+    except Exception:
+        user = "unknown"
+    scope_key = "forecast|workspace|global|"
+    metadata = {
+        "source": "volume-summary-phase2",
+        "saved_at": pd.Timestamp.utcnow().isoformat(),
+    }
+    try:
+        run_id = cap_store.record_forecast_run(
+            scope_key=scope_key,
+            forecast_df=df,
+            created_by=user,
+            model_name="volume-summary",
+            metadata=metadata,
+            pushed_to_planning=False,
+        )
+        return f"Saved forecast run #{run_id} by {user}."
+    except Exception as exc:
+        return f"DB save failed: {exc}"
 
 
 @app.callback(
