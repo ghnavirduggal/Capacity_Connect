@@ -114,8 +114,14 @@ def _prep_smoothed_df(df: pd.DataFrame) -> pd.DataFrame:
     d["ds"] = pd.to_datetime(d["ds"], errors="coerce")
     if "Final_Smoothed_Value" not in d.columns and "y" in d.columns:
         d["Final_Smoothed_Value"] = _safe_num(d["y"])
-    if "IQ_value" in d.columns:
+    iq_col = _find_col(d, ("IQ_value",))
+    if iq_col and iq_col != "IQ_value":
+        d["IQ_value"] = _safe_num(d[iq_col])
+    elif "IQ_value" in d.columns:
         d["IQ_value"] = _safe_num(d["IQ_value"])
+    scaled_col = _find_col(d, ("IQ_value_scaled",))
+    if scaled_col and scaled_col != "IQ_value_scaled":
+        d["IQ_value_scaled"] = _safe_num(d[scaled_col])
     d = _ensure_iq_scaled(d)
     if "holiday_month_start" not in d.columns:
         if "holiday" in d.columns:
