@@ -710,6 +710,75 @@ def _vs_hide_loader(_msg, _results):
 
 @app.callback(
     Output("global-loading", "data", allow_duplicate=True),
+    Input("vs-run-prophet", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _vs_prophet_show_loader(n_clicks):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    logger.info("vs-prophet: show loader n_clicks=%s", n_clicks)
+    return True
+
+
+@app.callback(
+    Output("global-loading", "data", allow_duplicate=True),
+    Input("vs-prophet-status", "children"),
+    Input("vs-prophet-store", "data"),
+    prevent_initial_call=True,
+)
+def _vs_prophet_hide_loader(_status, _store):
+    logger.info("vs-prophet: hide loader")
+    return False
+
+
+@app.callback(
+    Output("global-loading", "data", allow_duplicate=True),
+    Input("vs-apply-seasonality", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _vs_apply_seasonality_show_loader(n_clicks):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    logger.info("vs-seasonality: show loader n_clicks=%s", n_clicks)
+    return True
+
+
+@app.callback(
+    Output("global-loading", "data", allow_duplicate=True),
+    Input("vs-seasonality-status", "children"),
+    Input("vs-seasonality-store", "data"),
+    prevent_initial_call=True,
+)
+def _vs_apply_seasonality_hide_loader(_status, _store):
+    logger.info("vs-seasonality: hide loader")
+    return False
+
+
+@app.callback(
+    Output("global-loading", "data", allow_duplicate=True),
+    Input("vs-save-prophet", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _vs_save_prophet_show_loader(n_clicks):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    logger.info("vs-prophet-save: show loader n_clicks=%s", n_clicks)
+    return True
+
+
+@app.callback(
+    Output("global-loading", "data", allow_duplicate=True),
+    Input("vs-prophet-save-status", "children"),
+    Input("vs-prophet-store", "data"),
+    prevent_initial_call=True,
+)
+def _vs_save_prophet_hide_loader(_status, _store):
+    logger.info("vs-prophet-save: hide loader")
+    return False
+
+
+@app.callback(
+    Output("global-loading", "data", allow_duplicate=True),
     Input("sa-run-smoothing", "n_clicks"),
     Input("sa-run-prophet", "n_clicks"),
     prevent_initial_call=True,
