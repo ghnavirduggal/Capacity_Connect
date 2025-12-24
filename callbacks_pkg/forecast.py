@@ -789,6 +789,52 @@ def _vs_save_prophet_hide_loader(_status, _store):
 
 @app.callback(
     Output("global-loading", "data", allow_duplicate=True),
+    Input("vs-run-phase1", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _vs_phase1_show_loader(n_clicks):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    logger.info("vs-phase1: show loader n_clicks=%s", n_clicks)
+    return True
+
+
+@app.callback(
+    Output("global-loading", "data", allow_duplicate=True),
+    Input("vs-phase1-status", "children"),
+    Input("vs-phase1-results", "data"),
+    prevent_initial_call=True,
+)
+def _vs_phase1_hide_loader(_status, _results):
+    logger.info("vs-phase1: hide loader")
+    return False
+
+
+@app.callback(
+    Output("global-loading", "data", allow_duplicate=True),
+    Input("vs-run-phase2", "n_clicks"),
+    prevent_initial_call=True,
+)
+def _vs_phase2_show_loader(n_clicks):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    logger.info("vs-phase2: show loader n_clicks=%s", n_clicks)
+    return True
+
+
+@app.callback(
+    Output("global-loading", "data", allow_duplicate=True),
+    Input("vs-phase2-status", "children"),
+    Input("vs-phase2-store", "data"),
+    prevent_initial_call=True,
+)
+def _vs_phase2_hide_loader(_status, _store):
+    logger.info("vs-phase2: hide loader")
+    return False
+
+
+@app.callback(
+    Output("global-loading", "data", allow_duplicate=True),
     Input("sa-run-smoothing", "n_clicks"),
     Input("sa-run-prophet", "n_clicks"),
     prevent_initial_call=True,
@@ -1327,7 +1373,6 @@ def _on_vs_upload(contents, filename):
     Output("vs-summary", "columns"),
     Output("vs-alert", "children"),
     Output("vs-alert", "is_open"),
-    Output("vs-next-modal", "is_open"),
     Output("vs-category", "options"),
     Output("vs-category", "value"),
     Output("vs-pivot", "data"),
@@ -1345,11 +1390,10 @@ def _on_vs_upload(contents, filename):
     Input("vs-run-btn", "n_clicks"),
     State("vs-data-store", "data"),
     State("vs-iq-summary-store", "data"),
-    State("vs-next-modal", "is_open"),
     State("forecast-phase-store", "data"),
     prevent_initial_call=True,
 )
-def _run_volume_summary(n_clicks, data_json, iq_summary_store, modal_open, phase_store):
+def _run_volume_summary(n_clicks, data_json, iq_summary_store, phase_store):
     logger.info("vs-run: start n_clicks=%s data_json=%s", n_clicks, bool(data_json))
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
@@ -1360,7 +1404,6 @@ def _run_volume_summary(n_clicks, data_json, iq_summary_store, modal_open, phase
             [],
             "Upload data to run the summary.",
             True,
-            False,
             [],
             None,
             [],
@@ -1472,7 +1515,6 @@ def _run_volume_summary(n_clicks, data_json, iq_summary_store, modal_open, phase
             cols,
             alert_text,
             True,
-            True,
             options,
             chosen,
             (piv0.to_dict("records") if not piv0.empty else []),
@@ -1495,7 +1537,6 @@ def _run_volume_summary(n_clicks, data_json, iq_summary_store, modal_open, phase
             [],
             f"Volume summary failed: {exc}",
             True,
-            False,
             [],
             None,
             [],
@@ -1536,18 +1577,6 @@ for _btn, _modal in [
     ("di-complete", "di-complete-modal"),
 ]:
     _toggle_modal(_btn, _modal)
-
-
-@app.callback(
-    Output("vs-next-modal", "is_open", allow_duplicate=True),
-    Input("vs-modal-close", "n_clicks"),
-    State("vs-next-modal", "is_open"),
-    prevent_initial_call=True,
-)
-def _close_vs_modal(n, is_open):
-    if not n:
-        raise dash.exceptions.PreventUpdate
-    return False
 
 
 @app.callback(
@@ -2692,25 +2721,52 @@ def _download_adjusted_forecast(n_clicks, adjusted_json):
 
 @app.callback(
     Output("vs-save-adjusted-status", "children", allow_duplicate=True),
+    Output("vs-save-adjusted-download", "data"),
+    Output("vs-next-step", "style"),
     Input("vs-save-adjusted", "n_clicks"),
     State("vs-adjusted-store", "data"),
+    State("vs-category", "value"),
     prevent_initial_call=True,
 )
-def _save_adjusted_to_db(n_clicks, adjusted_json):
+def _save_adjusted_to_db(n_clicks, adjusted_json, category):
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
+    hidden_style = {"display": "none"}
+    shown_style = {"display": "inline-block"}
     if not adjusted_json:
-        return "No adjusted forecast to save."
+        return "No adjusted forecast to save.", no_update, hidden_style
     try:
         df = pd.read_json(io.StringIO(adjusted_json), orient="split")
     except Exception as exc:
-        return f"Could not parse adjusted forecast: {exc}"
+        return f"Could not parse adjusted forecast: {exc}", no_update, hidden_style
     if df.empty:
-        return "Adjusted forecast is empty."
+        return "Adjusted forecast is empty.", no_update, hidden_style
+
+    def _safe_filename_part(value: Optional[str], fallback: str) -> str:
+        if not value:
+            return fallback
+        cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value)).strip("_")
+        return cleaned or fallback
+
+    group_name = None
+    if "forecast_group" in df.columns:
+        unique_groups = [str(v) for v in df["forecast_group"].dropna().unique()]
+        if len(unique_groups) == 1:
+            group_name = unique_groups[0]
+        elif len(unique_groups) > 1:
+            group_name = "multiple_groups"
+    if not group_name:
+        group_name = category or "forecast_group"
     try:
         user = current_user_fallback() or "unknown"
     except Exception:
         user = "unknown"
+    ts = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
+    filename = (
+        f"Monthly_Forecast_{_safe_filename_part(group_name, 'forecast_group')}"
+        f"_{ts}_{_safe_filename_part(user, 'user')}.csv"
+    )
+    download_data = dcc.send_data_frame(df.to_csv, filename, index=False)
     scope_key = "forecast|workspace|global|"
     metadata = {
         "source": "volume-summary-phase2",
@@ -2725,9 +2781,11 @@ def _save_adjusted_to_db(n_clicks, adjusted_json):
             metadata=metadata,
             pushed_to_planning=False,
         )
-        return f"Saved forecast run #{run_id} by {user}."
+        status = f"Saved forecast run #{run_id} by {user}. Downloading {filename}."
+        return status, download_data, shown_style
     except Exception as exc:
-        return f"DB save failed: {exc}"
+        status = f"Download ready ({filename}). DB save failed: {exc}"
+        return status, download_data, shown_style
 
 
 @app.callback(
