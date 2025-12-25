@@ -391,6 +391,36 @@ def _format_ratio_wide(df: pd.DataFrame, add_avg: bool = False) -> pd.DataFrame:
         out[col] = pd.to_numeric(out[col], errors="coerce").apply(
             lambda v: f"{v * 100:.2f}%" if pd.notna(v) else ""
         )
+    month_cols = [c for c in out.columns if c not in ["Model", "Avg"]]
+    ordered_months = _sort_month_year_columns(month_cols)
+    ordered_cols = ["Model"]
+    if "Avg" in out.columns:
+        ordered_cols.append("Avg")
+    ordered_cols.extend(ordered_months)
+    ordered_cols.extend([c for c in out.columns if c not in ordered_cols])
+    out = out[ordered_cols]
+    return out
+
+
+def _sort_month_year_columns(cols: list[str]) -> list[str]:
+    parsed: list[tuple[Optional[pd.Timestamp], int, str]] = []
+    for idx, col in enumerate(cols):
+        dt = pd.to_datetime(col, format="%b-%y", errors="coerce")
+        parsed.append((dt, idx, col))
+    parsed.sort(key=lambda item: (pd.isna(item[0]), item[0] if pd.notna(item[0]) else pd.Timestamp.max, item[1]))
+    return [col for _, _, col in parsed]
+
+
+def _sort_year_month(df: pd.DataFrame, year_col: str = "Year", month_col: str = "Month") -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    if year_col not in df.columns or month_col not in df.columns:
+        return df
+    out = df.copy()
+    month_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    out[month_col] = out[month_col].astype(str).str.strip()
+    out["_month_order"] = pd.Categorical(out[month_col], categories=month_order, ordered=True)
+    out = out.sort_values([year_col, "_month_order"]).drop(columns=["_month_order"])
     return out
 
 
@@ -1918,7 +1948,9 @@ def _run_prophet_smoothing(n_clicks, seasonality_store, iq_summary_store, cat, h
             .reset_index()
         )
         months_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-        cols = ["Year"] + [m for m in months_order if m in norm2_pivot.columns]
+        month_cols = [m for m in months_order if m in norm2_pivot.columns]
+        norm2_pivot["Avg"] = norm2_pivot[month_cols].mean(axis=1).round(2)
+        cols = ["Year"] + month_cols + ["Avg"]
         norm2_pivot = norm2_pivot[cols]
 
         line_fig = go.Figure()
@@ -2041,7 +2073,9 @@ def _save_prophet_changes(n_clicks, table_rows, prophet_store):
         .reset_index()
     )
     months_order = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-    cols = ["Year"] + [m for m in months_order if m in norm2_pivot.columns]
+    month_cols = [m for m in months_order if m in norm2_pivot.columns]
+    norm2_pivot["Avg"] = norm2_pivot[month_cols].mean(axis=1).round(2)
+    cols = ["Year"] + month_cols + ["Avg"]
     norm2_pivot = norm2_pivot[cols]
 
     payload["prophet_table"] = new_df.to_json(date_format="iso", orient="split")
@@ -2590,9 +2624,12 @@ def _run_phase2_from_volume(
     base_display = base_df[[c for c in base_cols if c in base_df.columns]].copy()
     if "Original_volume_Category" in base_display.columns:
         base_display = base_display.rename(columns={"Original_volume_Category": "Original_Volume_Category"})
+    base_display = _sort_year_month(base_display)
+    base_display = _clean_table(base_display)
 
     fg_summary = pd.DataFrame()
     fg_split = pd.DataFrame()
+    fg_monthly = pd.DataFrame()
     volume_split_edit = pd.DataFrame()
     volume_split_info = ""
     if results_store and cat:
@@ -2607,6 +2644,17 @@ def _run_phase2_from_volume(
                 fg_summary, fg_split, _, _, _ = forecast_group_pivot_and_long_style(df_norm, cat)
             except Exception:
                 fg_summary, fg_split = _fallback_pivots(df_norm, cat)
+            if not df_norm.empty and {"date", "volume", "forecast_group", "category"}.issubset(df_norm.columns):
+                df_cat = df_norm[df_norm["category"] == cat].copy()
+                df_cat["ds"] = pd.to_datetime(df_cat["date"], errors="coerce")
+                df_cat["Year"] = df_cat["ds"].dt.year
+                df_cat["Month"] = df_cat["ds"].dt.strftime("%b")
+                df_cat["volume"] = pd.to_numeric(df_cat["volume"], errors="coerce")
+                df_cat = df_cat.dropna(subset=["Year", "Month", "forecast_group", "volume"])
+                if not df_cat.empty:
+                    fg_monthly = (
+                        df_cat.groupby(["Year", "Month", "forecast_group"], as_index=False)["volume"].sum()
+                    )
 
     if fg_split is not None and not fg_split.empty:
         split_clean = fg_split.copy()
@@ -2643,6 +2691,11 @@ def _run_phase2_from_volume(
             f"Final normalized: {volume_split_edit['Vol_Split_Normalized'].sum():.1f}%"
         )
 
+    if fg_summary is not None and not fg_summary.empty:
+        fg_summary = _clean_table(fg_summary)
+    if fg_split is not None and not fg_split.empty:
+        fg_split = _clean_table(fg_split)
+
     edit_cols = [
         {"name": "Forecast Group", "id": "forecast_group", "editable": False},
         {"name": "Year", "id": "Year", "editable": False},
@@ -2655,6 +2708,9 @@ def _run_phase2_from_volume(
         "forecast_group_split": fg_split.to_json(date_format="iso", orient="split") if fg_split is not None else None,
         "volume_split_edit": volume_split_edit.to_json(date_format="iso", orient="split")
         if not volume_split_edit.empty
+        else None,
+        "forecast_group_monthly": fg_monthly.to_json(date_format="iso", orient="split")
+        if fg_monthly is not None and not fg_monthly.empty
         else None,
     }
 
@@ -2703,8 +2759,10 @@ def _apply_volume_split(n_clicks, split_rows, phase2_store):
     try:
         payload = json.loads(phase2_store) if isinstance(phase2_store, str) else phase2_store
         base_json = payload.get("base_df")
+        fg_monthly_json = payload.get("forecast_group_monthly")
     except Exception:
         base_json = None
+        fg_monthly_json = None
     if not base_json:
         return [], [], [], [], "Phase 2 base forecast missing.", None
     base_df = pd.read_json(io.StringIO(base_json), orient="split")
@@ -2738,12 +2796,39 @@ def _apply_volume_split(n_clicks, split_rows, phase2_store):
     if adjusted_df.empty:
         return [], [], [], [], "No adjusted forecast generated.", None
 
+    if "Contact_Ratio_Forecast_Category" in adjusted_df.columns:
+        adjusted_df["Contact_Ratio_Forecast_Group"] = adjusted_df["Contact_Ratio_Forecast_Category"]
+    if "IQ_value_Category" in adjusted_df.columns:
+        adjusted_df["IQ_Value_Category"] = adjusted_df["IQ_value_Category"]
+    adjusted_df["Volume_Split%_Forecast_Group"] = pd.to_numeric(
+        adjusted_df.get("Volume_Split_%Fg"), errors="coerce"
+    )
+
+    fg_monthly = pd.DataFrame()
+    if fg_monthly_json:
+        try:
+            fg_monthly = pd.read_json(io.StringIO(fg_monthly_json), orient="split")
+        except Exception:
+            fg_monthly = pd.DataFrame()
+    if not fg_monthly.empty:
+        fg_monthly["Year"] = pd.to_numeric(fg_monthly["Year"], errors="coerce")
+        fg_monthly["Month"] = fg_monthly["Month"].astype(str).str.strip()
+        fg_monthly["volume"] = pd.to_numeric(fg_monthly.get("volume"), errors="coerce")
+        fg_monthly = fg_monthly.dropna(subset=["Year", "Month", "forecast_group", "volume"])
+        fg_monthly = fg_monthly.rename(columns={"volume": "Actual_Forecast_Group_Original_Volume"})
+        adjusted_df = adjusted_df.merge(
+            fg_monthly[["Year", "Month", "forecast_group", "Actual_Forecast_Group_Original_Volume"]],
+            on=["Year", "Month", "forecast_group"],
+            how="left",
+        )
+
     verify_df = adjusted_df.groupby(["Year", "Month", "Model"], as_index=False).agg(
         Base_Forecast_Category=("Base_Forecast_Category", "first"),
         Base_Forecast_for_Forecast_Group=("Base_Forecast_for_Forecast_Group", "sum"),
     )
     verify_df["Difference"] = (
-        verify_df["Base_Forecast_for_Forecast_Group"] - verify_df["Base_Forecast_Category"]
+        pd.to_numeric(verify_df["Base_Forecast_for_Forecast_Group"], errors="coerce")
+        - pd.to_numeric(verify_df["Base_Forecast_Category"], errors="coerce")
     )
 
     display_cols = [
@@ -2751,19 +2836,34 @@ def _apply_volume_split(n_clicks, split_rows, phase2_store):
         "Month",
         "Model",
         "forecast_group",
-        "Volume_Split_%Fg",
+        "Volume_Split%_Forecast_Group",
+        "Contact_Ratio_Forecast_Group",
+        "IQ_Value_Category",
         "Base_Forecast_Category",
         "Base_Forecast_for_Forecast_Group",
-        "Original_volume_Category",
-        "Normalized_Volume_Category",
+        "Actual_Forecast_Group_Original_Volume",
     ]
     adjusted_display = adjusted_df[[c for c in display_cols if c in adjusted_df.columns]].copy()
-    adjusted_display = adjusted_display.rename(
-        columns={
-            "Volume_Split_%Fg": "Volume_Split%_Forecast_Group",
-            "Original_volume_Category": "Original_Volume_Category",
-        }
-    )
+    adjusted_display = adjusted_display.rename(columns={"forecast_group": "Forecast_Group"})
+    required_cols = [
+        "Year",
+        "Month",
+        "Model",
+        "Forecast_Group",
+        "Volume_Split%_Forecast_Group",
+        "Contact_Ratio_Forecast_Group",
+        "IQ_Value_Category",
+        "Base_Forecast_Category",
+        "Base_Forecast_for_Forecast_Group",
+        "Actual_Forecast_Group_Original_Volume",
+    ]
+    for col in required_cols:
+        if col not in adjusted_display.columns:
+            adjusted_display[col] = None
+    adjusted_display = adjusted_display[required_cols]
+    adjusted_display = _sort_year_month(adjusted_display)
+    verify_df = _sort_year_month(verify_df)
+    verify_df = _clean_table(verify_df)
     adjusted_store = adjusted_df.to_json(date_format="iso", orient="split")
     status = "Volume Split Applied successfully to base forecast."
     return (
