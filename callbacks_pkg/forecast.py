@@ -377,6 +377,23 @@ def _clean_table(df: pd.DataFrame) -> pd.DataFrame:
     return cleaned.applymap(_strip_nan)
 
 
+def _format_ratio_wide(df: pd.DataFrame, add_avg: bool = False) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    value_cols = [c for c in out.columns if c != "Model"]
+    if not value_cols:
+        return out
+    numeric = out[value_cols].apply(pd.to_numeric, errors="coerce")
+    if add_avg:
+        out.insert(1, "Avg", numeric.mean(axis=1, skipna=True).round(4))
+    for col in [c for c in out.columns if c != "Model"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce").apply(
+            lambda v: f"{v * 100:.2f}%" if pd.notna(v) else ""
+        )
+    return out
+
+
 def _safe_float(val: Any, default: float = 0.0) -> float:
     try:
         return float(val)
@@ -1373,8 +1390,8 @@ def _on_vs_upload(contents, filename):
     Output("vs-summary", "columns"),
     Output("vs-alert", "children"),
     Output("vs-alert", "is_open"),
-    Output("vs-category", "options"),
-    Output("vs-category", "value"),
+    Output("vs-category-tabs", "children"),
+    Output("vs-category-tabs", "value"),
     Output("vs-pivot", "data"),
     Output("vs-pivot", "columns"),
     Output("vs-volume-split", "data"),
@@ -1444,7 +1461,7 @@ def _run_volume_summary(n_clicks, data_json, iq_summary_store, phase_store):
             iq_payload = {}
         if not categories and iq_categories:
             categories = iq_categories
-        options = [{"label": c, "value": c} for c in categories]
+        tabs = [dcc.Tab(label=c, value=c) for c in categories]
         chosen = categories[0] if categories else None
 
         def _safe_pivots(cat: str):
@@ -1515,7 +1532,7 @@ def _run_volume_summary(n_clicks, data_json, iq_summary_store, phase_store):
             cols,
             alert_text,
             True,
-            options,
+            tabs,
             chosen,
             (piv0.to_dict("records") if not piv0.empty else []),
             pivot_cols,
@@ -1580,6 +1597,29 @@ for _btn, _modal in [
 
 
 @app.callback(
+    Output("vs-category-heading", "children"),
+    Input("vs-category-tabs", "value"),
+    prevent_initial_call=True,
+)
+def _update_category_heading(cat: Optional[str]):
+    if not cat:
+        return "Select a category to view its tables."
+    return f"Category: {cat}"
+
+
+@app.callback(
+    Output("vs-pivot-title", "children"),
+    Output("vs-volume-split-title", "children"),
+    Input("vs-category-tabs", "value"),
+    prevent_initial_call=True,
+)
+def _update_category_section_titles(cat: Optional[str]):
+    if not cat:
+        return "Forecast Group Pivot Analysis", "Volume Split Percentage"
+    return f"Forecast Group Pivot Analysis for {cat}", f"Volume Split Percentage for {cat}"
+
+
+@app.callback(
     Output("vs-pivot", "data", allow_duplicate=True),
     Output("vs-pivot", "columns", allow_duplicate=True),
     Output("vs-volume-split", "data", allow_duplicate=True),
@@ -1590,7 +1630,7 @@ for _btn, _modal in [
     Output("vs-volume-summary", "columns", allow_duplicate=True),
     Output("vs-contact-summary", "data", allow_duplicate=True),
     Output("vs-contact-summary", "columns", allow_duplicate=True),
-    Input("vs-category", "value"),
+    Input("vs-category-tabs", "value"),
     State("vs-results-store", "data"),
     State("vs-iq-summary-store", "data"),
     prevent_initial_call=True,
@@ -1664,7 +1704,7 @@ def _on_category_change(cat, store_json, iq_summary_store):
     Output("vs-normalized-table", "columns"),
     Output("vs-seasonality-status", "children"),
     Output("vs-seasonality-store", "data"),
-    Input("vs-category", "value"),
+    Input("vs-category-tabs", "value"),
     Input("vs-iq-summary-store", "data"),
     prevent_initial_call=True,
 )
@@ -1791,7 +1831,7 @@ def _apply_seasonality_changes(n_clicks, capped_rows, lower_cap, upper_cap, base
     Input("vs-run-prophet", "n_clicks"),
     State("vs-seasonality-store", "data"),
     State("vs-iq-summary-store", "data"),
-    State("vs-category", "value"),
+    State("vs-category-tabs", "value"),
     State("vs-holiday-store", "data"),
     prevent_initial_call=True,
 )
@@ -2199,6 +2239,16 @@ def _run_phase1_from_volume(n_clicks, prophet_store, phase_store, holiday_store)
             download_csv = create_download_csv_with_metadata(wide, tuned_config)
         except Exception:
             download_csv = None
+
+    display_results = pd.DataFrame()
+    if not wide.empty:
+        display_results = _format_ratio_wide(wide, add_avg=True)
+    elif not combined.empty:
+        display_results = combined.copy()
+        if "Forecast" in display_results.columns:
+            display_results["Forecast"] = pd.to_numeric(
+                display_results["Forecast"], errors="coerce"
+            ).apply(lambda v: f"{v * 100:.2f}%" if pd.notna(v) else "")
     if results:
         status_lines.append("Prophet Forecast Done" if results.get("prophet") is not None else "Prophet Forecast Failed")
         status_lines.append("RF Forecast Done" if results.get("random_forest") is not None else "RF Forecast Failed")
@@ -2217,8 +2267,8 @@ def _run_phase1_from_volume(n_clicks, prophet_store, phase_store, holiday_store)
     config_store = json.dumps(tuned_config)
     return (
         html.Ul([html.Li(line) for line in status_lines]),
-        combined.to_dict("records") if not combined.empty else [],
-        _cols(combined) if not combined.empty else [],
+        display_results.to_dict("records") if not display_results.empty else [],
+        _cols(display_results) if not display_results.empty else [],
         accuracy_tbl.to_dict("records") if isinstance(accuracy_tbl, pd.DataFrame) and not accuracy_tbl.empty else [],
         _cols(accuracy_tbl) if isinstance(accuracy_tbl, pd.DataFrame) and not accuracy_tbl.empty else [],
         tuning_tbl.to_dict("records") if not tuning_tbl.empty else [],
@@ -2340,7 +2390,7 @@ def _download_phase1_results(n_clicks, csv_text):
     State("vs-phase1-config-store", "data"),
     State("vs-results-store", "data"),
     State("vs-iq-summary-store", "data"),
-    State("vs-category", "value"),
+    State("vs-category-tabs", "value"),
     prevent_initial_call=True,
 )
 def _run_phase2_from_volume(
@@ -2517,6 +2567,16 @@ def _run_phase2_from_volume(
     base_df["Original_volume_Category"] = pd.to_numeric(base_df.get("Original_volume"), errors="coerce")
     base_df["Normalized_Volume_Category"] = pd.to_numeric(base_df.get("Normalized_Volume"), errors="coerce")
 
+    display_phase2 = pd.DataFrame()
+    if not wide.empty:
+        display_phase2 = _format_ratio_wide(wide)
+    elif not combined.empty:
+        display_phase2 = combined.copy()
+        if "Forecast" in display_phase2.columns:
+            display_phase2["Forecast"] = pd.to_numeric(
+                display_phase2["Forecast"], errors="coerce"
+            ).apply(lambda v: f"{v * 100:.2f}%" if pd.notna(v) else "")
+
     base_cols = [
         "Year",
         "Month",
@@ -2528,6 +2588,8 @@ def _run_phase2_from_volume(
         "Normalized_Volume_Category",
     ]
     base_display = base_df[[c for c in base_cols if c in base_df.columns]].copy()
+    if "Original_volume_Category" in base_display.columns:
+        base_display = base_display.rename(columns={"Original_volume_Category": "Original_Volume_Category"})
 
     fg_summary = pd.DataFrame()
     fg_split = pd.DataFrame()
@@ -2550,9 +2612,13 @@ def _run_phase2_from_volume(
         split_clean = fg_split.copy()
         split_clean = split_clean[split_clean["Year"] != "--------"].copy() if "Year" in split_clean.columns else split_clean
         split_clean["Year_Numeric"] = pd.to_numeric(split_clean["Year"], errors="coerce")
-        latest_data = split_clean.groupby("forecast_group").apply(
-            lambda x: x.loc[x["Year_Numeric"].idxmax()]
-        ).reset_index(drop=True)
+        def _pick_latest(group: pd.DataFrame) -> pd.Series:
+            year_numeric = group["Year_Numeric"]
+            if year_numeric.notna().any():
+                return group.loc[year_numeric.idxmax()]
+            return group.iloc[-1]
+
+        latest_data = split_clean.groupby("forecast_group").apply(_pick_latest).reset_index(drop=True)
         if "Vol_Split_Last_3M" in latest_data.columns:
             latest_data["Vol_Split_Last_3M_Numeric"] = (
                 latest_data["Vol_Split_Last_3M"].astype(str).str.replace("%", "", regex=False)
@@ -2580,7 +2646,7 @@ def _run_phase2_from_volume(
     edit_cols = [
         {"name": "Forecast Group", "id": "forecast_group", "editable": False},
         {"name": "Year", "id": "Year", "editable": False},
-        {"name": "Vol_Split_Last_3M_Numeric", "id": "Vol_Split_Last_3M_Numeric", "editable": False},
+        {"name": "Volume Split% last 3Months", "id": "Vol_Split_Last_3M_Numeric", "editable": False},
         {"name": "Vol_Split_Normalized", "id": "Vol_Split_Normalized", "editable": True},
     ]
 
@@ -2594,8 +2660,8 @@ def _run_phase2_from_volume(
 
     return (
         f"Phase 2 forecast ready ({forecast_months} months).",
-        combined.to_dict("records"),
-        _cols(combined),
+        display_phase2.to_dict("records") if not display_phase2.empty else [],
+        _cols(display_phase2) if not display_phase2.empty else [],
         base_display.to_dict("records"),
         _cols(base_display),
         fg_summary.to_dict("records") if fg_summary is not None and not fg_summary.empty else [],
@@ -2692,6 +2758,12 @@ def _apply_volume_split(n_clicks, split_rows, phase2_store):
         "Normalized_Volume_Category",
     ]
     adjusted_display = adjusted_df[[c for c in display_cols if c in adjusted_df.columns]].copy()
+    adjusted_display = adjusted_display.rename(
+        columns={
+            "Volume_Split_%Fg": "Volume_Split%_Forecast_Group",
+            "Original_volume_Category": "Original_Volume_Category",
+        }
+    )
     adjusted_store = adjusted_df.to_json(date_format="iso", orient="split")
     status = "Volume Split Applied successfully to base forecast."
     return (
@@ -2725,7 +2797,7 @@ def _download_adjusted_forecast(n_clicks, adjusted_json):
     Output("vs-next-step", "style"),
     Input("vs-save-adjusted", "n_clicks"),
     State("vs-adjusted-store", "data"),
-    State("vs-category", "value"),
+    State("vs-category-tabs", "value"),
     prevent_initial_call=True,
 )
 def _save_adjusted_to_db(n_clicks, adjusted_json, category):
