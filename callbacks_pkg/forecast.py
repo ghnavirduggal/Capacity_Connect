@@ -2343,7 +2343,9 @@ def _render_phase1_configs(config_json):
             data=df.to_dict("records"),
             columns=_cols(df),
             page_size=8,
-            style_table={"overflowX": "auto"},
+            page_action="none",
+            fixed_rows={"headers": True},
+            style_table={"overflowX": "auto", "overflowY": "auto", "maxHeight": "360px"},
             style_cell={"fontSize": 12, "padding": "6px 8px"},
             style_header={"fontWeight": "600"},
         )
@@ -2546,10 +2548,40 @@ def _run_phase2_from_volume(
     combined["Year"] = combined["ds"].dt.year
     combined["Month"] = combined["ds"].dt.strftime("%b")
 
-    merged_df = combined.copy()
+    history_df = pd.DataFrame()
+    if "ds" in df_smooth.columns:
+        history_df = df_smooth.copy()
+        history_df["ds"] = pd.to_datetime(history_df["ds"], errors="coerce")
+        history_df = history_df.dropna(subset=["ds"])
+        if not history_df.empty:
+            history_df["Year"] = history_df["ds"].dt.year
+            history_df["Month"] = history_df["ds"].dt.strftime("%b")
+            history_df["Month_Year"] = history_df["ds"].dt.strftime("%b-%y")
+            ratio_vals = pd.to_numeric(history_df.get("Final_Smoothed_Value"), errors="coerce")
+            if ratio_vals.notna().any() and ratio_vals.dropna().median() > 1:
+                ratio_vals = ratio_vals / 100.0
+            history_df["Forecast"] = ratio_vals
+            history_df["Model"] = "Final_smoothed"
+            keep_cols = ["ds", "Year", "Month", "Month_Year", "Model", "Forecast"]
+            for col in ("IQ_value", "Normalized_Volume"):
+                if col in history_df.columns:
+                    keep_cols.append(col)
+            history_df = history_df[keep_cols]
+
+    merged_df = pd.concat([history_df, combined], ignore_index=True) if not history_df.empty else combined.copy()
     if not iq_long.empty:
-        merged_df = merged_df.merge(iq_long, on=["Year", "Month"], how="left")
+        merged_df = merged_df.merge(iq_long, on=["Year", "Month"], how="left", suffixes=("", "_iq"))
+        if "IQ_value_iq" in merged_df.columns:
+            merged_df["IQ_value"] = merged_df["IQ_value"].fillna(merged_df["IQ_value_iq"])
+            merged_df = merged_df.drop(columns=["IQ_value_iq"])
+    merged_df["ds"] = pd.to_datetime(merged_df.get("ds"), errors="coerce")
+    merged_df = merged_df.sort_values("ds").reset_index(drop=True)
     merged_df["IQ_value"] = pd.to_numeric(merged_df.get("IQ_value"), errors="coerce")
+    if merged_df["IQ_value"].notna().any():
+        merged_df["IQ_value"] = merged_df.groupby(["Year", "Month"])["IQ_value"].transform(
+            lambda s: s.fillna(s.dropna().iloc[0]) if s.dropna().any() else s
+        )
+        merged_df["IQ_value"] = merged_df["IQ_value"].ffill()
     merged_df["Forecast"] = pd.to_numeric(merged_df.get("Forecast"), errors="coerce")
     merged_df["Base_Forecast_Category"] = (
         merged_df["Forecast"] * merged_df["IQ_value"] / 1_000_000
