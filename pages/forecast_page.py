@@ -156,7 +156,7 @@ def _nav_buttons():
                 ),
                 xs=12,
                 sm=6,
-                md=4,
+                md=12,
                 lg=3,
             )
             for item in FORECAST_NAV
@@ -295,21 +295,36 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                 dbc.Row(
                     [
                         dbc.Col(
+                            html.H4("Upload data"),
+                            className="EB21"
+                        ),
+                        dbc.Col(
+                            dcc.Upload(
+                                id="vs-upload",
+                                children=html.Div(["Drag & drop or ", html.Strong("select a CSV/XLSX file")]),
+                                multiple=False,
+                                accept=".csv,.xls,.xlsx,.xlsm",
+                                className="border border-secondary rounded p-3 mb-2 bg-light",
+                            ),
+                            className="EB21"
+                        ), 
+                        dbc.Col(
                             [
-                                html.H4("Upload data"),
-                                dcc.Upload(
-                                    id="vs-upload",
-                                    children=html.Div(["Drag & drop or ", html.Strong("select a CSV/XLSX file")]),
-                                    multiple=False,
-                                    accept=".csv,.xls,.xlsx,.xlsm",
-                                    className="border border-secondary rounded p-3 mb-2 bg-light",
-                                ),
-                                html.Div(id="vs-upload-msg", className="small text-muted"),
                                 dbc.Button("Run Volume Summary", id="vs-run-btn", color="primary", className="mt-2"),
                                 dbc.Alert(id="vs-alert", color="info", is_open=False, className="mt-2"),
                             ],
-                            md=4,
+                            className="EB21"
                         ),
+                    ],
+                    className="EB2"
+                ),  
+                dbc.Row(
+                    dbc.Col(
+                        html.Div(id="vs-upload-msg", className="small text-muted"),
+                    ),
+                ),
+                dbc.Row(
+                    [
                         dbc.Col(
                             [
                                 html.H4("Preview"),
@@ -328,19 +343,27 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                 html.H5("Volume Summary"),
                                 _table("vs-volume-summary", page_size=8),
                                 html.Hr(),
-                                html.H5("Contact Ratio Summary"),
+                                html.H5("Contact Ratio Summary (Volume/IQ)"),
                                 _table("vs-contact-summary", page_size=8),
                                 html.Hr(),
                                 html.Div(
                                     [
-                                        html.H5("Forecast group view", className="mb-1"),
-                                        dcc.Dropdown(id="vs-category", options=[], value=None, placeholder="Select category"),
+                                        html.H5("Category", className="mb-1"),
+                                        dcc.Tabs(
+                                            id="vs-category-tabs",
+                                            value=None,
+                                            children=[],
+                                            className="vs-category-tabs",
+                                            parent_className="vs-category-tabs-wrapper",
+                                        ),
+                                        html.Div(id="vs-category-heading", className="small text-muted mt-1"),
                                     ],
                                     className="mb-2",
                                 ),
+                                html.H5(id="vs-pivot-title", className="mb-1"),
                                 _table("vs-pivot", page_size=10),
                                 html.Hr(),
-                                html.H5("Volume split (%)"),
+                                html.H5(id="vs-volume-split-title"),
                                 _table("vs-volume-split", page_size=10),
                                 html.Hr(),
                                 html.H5("Seasonality (Based on Contact Ratio)"),
@@ -459,14 +482,14 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                                 id="vs-phase2-start",
                                                 placeholder="Start date",
                                             ),
-                                            md=6,
+                                            md=1, style={"marginRight": "105px"},
                                         ),
                                         dbc.Col(
                                             dcc.DatePickerSingle(
                                                 id="vs-phase2-end",
                                                 placeholder="End date",
                                             ),
-                                            md=6,
+                                            md=1,
                                         ),
                                     ],
                                     className="g-2 mb-2",
@@ -542,7 +565,7 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                     style={"display": "none"},
                                 ),
                             ],
-                            md=8,
+                            md=12,
                         ),
                     ],
                     className="g-3",
@@ -578,15 +601,15 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                 html.Div("Smoothing & anomaly configuration", className="fw-semibold mb-2"),
                                 dbc.Row(
                                     [
-                                        dbc.Col(dbc.InputGroup([dbc.InputGroupText("EWMA span"), dbc.Input(id="sa-window", type="number", value=6, min=1)]), md=6),
-                                        dbc.Col(dbc.InputGroup([dbc.InputGroupText("Z-score threshold"), dbc.Input(id="sa-threshold", type="number", value=2.5, step=0.1)]), md=6),
+                                        dbc.Col(dbc.InputGroup([dbc.InputGroupText("EWMA span"), dbc.Input(id="sa-window", type="number", value=6, min=1)]), md=12),
+                                        dbc.Col(dbc.InputGroup([dbc.InputGroupText("Z-score threshold"), dbc.Input(id="sa-threshold", type="number", value=2.5, step=0.1)]), md=12),
                                     ],
                                     className="g-2",
                                 ),
                                 dbc.Row(
                                     [
-                                        dbc.Col(dbc.InputGroup([dbc.InputGroupText("Prophet fourier"), dbc.Input(id="sa-prophet-order", type="number", value=5, min=1)]), md=6),
-                                        dbc.Col(dbc.InputGroup([dbc.InputGroupText("Hold-out months"), dbc.Input(id="sa-holdout", type="number", value=0, min=0)]), md=6),
+                                        dbc.Col(dbc.InputGroup([dbc.InputGroupText("Prophet fourier"), dbc.Input(id="sa-prophet-order", type="number", value=5, min=1)]), md=12),
+                                        dbc.Col(dbc.InputGroup([dbc.InputGroupText("Hold-out months"), dbc.Input(id="sa-holdout", type="number", value=0, min=0)]), md=12),
                                     ],
                                     className="g-2 mt-1",
                                 ),
@@ -611,7 +634,7 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                             ],
                             body=True,
                         ),
-                        md=4,
+                        md=12,
                     ),
                     dbc.Col(
                         dbc.Tabs(
@@ -685,7 +708,7 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                             ],
                             active_tab="series",
                         ),
-                        md=8,
+                        md=12,
                     ),
                 ],
                 className="g-3",
@@ -767,22 +790,22 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                         [
                                             dbc.Row(
                                                 [
-                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("ChangePoint Prior"), dbc.Input(id="fc-prophet-cps", type="number", step=0.01)]), md=6),
-                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("Seasonality Prior"), dbc.Input(id="fc-prophet-sps", type="number", step=0.01)]), md=6),
+                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("ChangePoint Prior"), dbc.Input(id="fc-prophet-cps", type="number", step=0.01)]), md=12),
+                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("Seasonality Prior"), dbc.Input(id="fc-prophet-sps", type="number", step=0.01)]), md=12),
                                                 ],
                                                 className="g-2",
                                             ),
                                             dbc.Row(
                                                 [
-                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("Holiday Prior"), dbc.Input(id="fc-prophet-hps", type="number", step=0.01)]), md=6),
-                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("Yearly Fourier Order"), dbc.Input(id="fc-prophet-fourier", type="number", step=1)]), md=6),
+                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("Holiday Prior"), dbc.Input(id="fc-prophet-hps", type="number", step=0.01)]), md=12),
+                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("Yearly Fourier Order"), dbc.Input(id="fc-prophet-fourier", type="number", step=1)]), md=12),
                                                 ],
                                                 className="g-2 mt-2",
                                             ),
                                             dbc.Row(
                                                 [
-                                                    dbc.Col(dbc.Checkbox(id="fc-prophet-holidays", label="Use holidays"), md=6),
-                                                    dbc.Col(dbc.Checkbox(id="fc-prophet-iq", label="Use IQ scaled"), md=6),
+                                                    dbc.Col(dbc.Checkbox(id="fc-prophet-holidays", label="Use holidays"), md=12),
+                                                    dbc.Col(dbc.Checkbox(id="fc-prophet-iq", label="Use IQ scaled"), md=12),
                                                 ],
                                                 className="g-2 mt-2",
                                             ),
@@ -793,15 +816,15 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                         [
                                             dbc.Row(
                                                 [
-                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("n_estimators"), dbc.Input(id="fc-rf-n", type="number", step=10)]), md=6),
-                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("max_depth"), dbc.Input(id="fc-rf-depth", type="number", step=1)]), md=6),
+                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("n_estimators"), dbc.Input(id="fc-rf-n", type="number", step=10)]), md=12),
+                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("max_depth"), dbc.Input(id="fc-rf-depth", type="number", step=1)]), md=12),
                                                 ],
                                                 className="g-2",
                                             ),
                                             dbc.Row(
                                                 [
-                                                    dbc.Col(dbc.Checkbox(id="fc-rf-holidays", label="Use holidays"), md=6),
-                                                    dbc.Col(dbc.Checkbox(id="fc-rf-iq", label="Use IQ scaled"), md=6),
+                                                    dbc.Col(dbc.Checkbox(id="fc-rf-holidays", label="Use holidays"), md=12),
+                                                    dbc.Col(dbc.Checkbox(id="fc-rf-iq", label="Use IQ scaled"), md=12),
                                                 ],
                                                 className="g-2 mt-2",
                                             ),
@@ -812,16 +835,16 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                         [
                                             dbc.Row(
                                                 [
-                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("n_estimators"), dbc.Input(id="fc-xgb-n", type="number", step=10)]), md=4),
-                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("learning_rate"), dbc.Input(id="fc-xgb-lr", type="number", step=0.01)]), md=4),
-                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("max_depth"), dbc.Input(id="fc-xgb-depth", type="number", step=1)]), md=4),
+                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("n_estimators"), dbc.Input(id="fc-xgb-n", type="number", step=10)]), md=12),
+                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("learning_rate"), dbc.Input(id="fc-xgb-lr", type="number", step=0.01)]), md=12),
+                                                    dbc.Col(dbc.InputGroup([dbc.InputGroupText("max_depth"), dbc.Input(id="fc-xgb-depth", type="number", step=1)]), md=12),
                                                 ],
                                                 className="g-2",
                                             ),
                                             dbc.Row(
                                                 [
-                                                    dbc.Col(dbc.Checkbox(id="fc-xgb-holidays", label="Use holidays"), md=6),
-                                                    dbc.Col(dbc.Checkbox(id="fc-xgb-iq", label="Use IQ scaled"), md=6),
+                                                    dbc.Col(dbc.Checkbox(id="fc-xgb-holidays", label="Use holidays"), md=12),
+                                                    dbc.Col(dbc.Checkbox(id="fc-xgb-iq", label="Use IQ scaled"), md=12),
                                                 ],
                                                 className="g-2 mt-2",
                                             ),
@@ -833,8 +856,8 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                             dbc.InputGroup([dbc.InputGroupText("Lags"), dbc.Input(id="fc-var-lags", type="number", step=1)]),
                                             dbc.Row(
                                                 [
-                                                    dbc.Col(dbc.Checkbox(id="fc-var-holidays", label="Use holidays"), md=6),
-                                                    dbc.Col(dbc.Checkbox(id="fc-var-iq", label="Use IQ scaled"), md=6),
+                                                    dbc.Col(dbc.Checkbox(id="fc-var-holidays", label="Use holidays"), md=12),
+                                                    dbc.Col(dbc.Checkbox(id="fc-var-iq", label="Use IQ scaled"), md=12),
                                                 ],
                                                 className="g-2 mt-2",
                                             ),
@@ -847,8 +870,8 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                             dbc.InputGroup([dbc.InputGroupText("seasonal (P,D,Q,s)"), dbc.Input(id="fc-sarimax-seasonal", type="text")], className="mb-2"),
                                             dbc.Row(
                                                 [
-                                                    dbc.Col(dbc.Checkbox(id="fc-sarimax-holidays", label="Use holidays"), md=6),
-                                                    dbc.Col(dbc.Checkbox(id="fc-sarimax-iq", label="Use IQ scaled"), md=6),
+                                                    dbc.Col(dbc.Checkbox(id="fc-sarimax-holidays", label="Use holidays"), md=12),
+                                                    dbc.Col(dbc.Checkbox(id="fc-sarimax-iq", label="Use IQ scaled"), md=12),
                                                 ],
                                                 className="g-2",
                                             ),
@@ -874,7 +897,7 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                             ),
                             dbc.Alert(id="fc-config-status", color="info", is_open=False),
                         ],
-                        md=4,
+                        md=12,
                     ),
                     dbc.Col(
                         [
@@ -931,7 +954,7 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                 active_tab="tables",
                             ),
                         ],
-                        md=8,
+                        md=12,
                     ),
                 ],
                 className="g-3",
@@ -1042,7 +1065,7 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                             ],
                             body=True,
                         ),
-                        md=4,
+                        md=12,
                     ),
                     dbc.Col(
                         dbc.Tabs(
@@ -1096,7 +1119,7 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                             ],
                             active_tab="tp-raw",
                         ),
-                        md=8,
+                        md=12,
                     ),
                 ],
                 className="g-3",
@@ -1138,7 +1161,7 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                                 options=[],
                                                 placeholder="Select forecast group",
                                             ),
-                                            md=6,
+                                            md=12,
                                         ),
                                         dbc.Col(
                                             dcc.Dropdown(
@@ -1146,7 +1169,7 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                                                 options=[],
                                                 placeholder="Select month",
                                             ),
-                                            md=6,
+                                            md=12,
                                         ),
                                     ],
                                     className="g-2 mb-2",
@@ -1195,7 +1218,7 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                             ],
                             body=True,
                         ),
-                        md=4,
+                        md=12,
                     ),
                     dbc.Col(
                         dbc.Card(
@@ -1242,7 +1265,7 @@ def page_forecast_section(slug: str, validation_only: bool = False):
                             ],
                             body=True,
                         ),
-                        md=8,
+                        md=12,
                     ),
                 ],
                 className="g-3",
