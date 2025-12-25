@@ -196,6 +196,22 @@ td{ height:35px; }
   min-height:20px; height:22px;
 }
 
+/* Category tabs (Volume Summary) */
+.vs-category-tabs-wrapper{
+  border-bottom: 1px solid #d9dee6;
+}
+.vs-category-tabs .tab{
+  padding: 6px 12px;
+  border: none !important;
+  background: transparent !important;
+  color: #4b5563;
+  font-weight: 600;
+}
+.vs-category-tabs .tab--selected{
+  color: #2563eb;
+  border-bottom: 2px solid #2563eb !important;
+}
+
 /* Upload dropzone (new) */
 .upload-zone{
   border:2px dashed #cfd6e4;
@@ -662,4 +678,41 @@ h6 {
 
 .rounded-pill {
   padding: 10px !important;
+}
+
+#vs-seasonality-chart, #vs-capped-chart, #vs-norm2-chart, #vs-prophet-line {
+  height: 450px !important;
+}
+
+.EB2 {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.EB21 {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  justify-content: center;
+  align-items: center;
+  width: max-content;
+}
+
+
+#vs-phase2-start .DateInput { width: 200px !important; font-size: small; }
+#vs-phase2-start .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#vs-phase2-start .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+#vs-phase2-end .DateInput { width: 200px !important; font-size: small; }
+#vs-phase2-end .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#vs-phase2-end .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+#vs-run-phase2 {
+  width: 213px;
+  margin-right: -1px;
+}
+
+#vs-clear-phase2 {
+  width: 212px;
 }
